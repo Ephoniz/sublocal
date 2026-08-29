@@ -8,9 +8,14 @@ from typing import Protocol
 
 from sublocal.cache import hf_cache_dir
 
+# Match the CLI promise: no telemetry. Must be set before huggingface_hub import.
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
 # CTranslate2 int8 conversion of Meta's distilled 600M NLLB-200.
 # Source weights: facebook/nllb-200-distilled-600M (CC-BY-NC-4.0).
 DEFAULT_MODEL_REPO = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+# Tokenizer files from the official NLLB repo (small; no model weights).
+DEFAULT_TOKENIZER_REPO = "facebook/nllb-200-distilled-600M"
 
 # Skip special tokens that CTranslate2 may leave on the hypothesis.
 _SKIP_TOKENS = {"</s>", "<s>", "<pad>", "<unk>"}
@@ -60,16 +65,26 @@ class NllbBackend:
         self.repo_id = repo_id or os.environ.get(
             "SUBLOCAL_MODEL_REPO", DEFAULT_MODEL_REPO
         )
+        self.tokenizer_repo = os.environ.get(
+            "SUBLOCAL_TOKENIZER_REPO", DEFAULT_TOKENIZER_REPO
+        )
         self._translator = None
         self._tokenizer = None
 
     def _ensure_loaded(self) -> None:
         if self._translator is not None:
             return
+        os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+        os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         from huggingface_hub import snapshot_download
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_error()
         from transformers import AutoTokenizer
         import ctranslate2
+        import logging
 
+        logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
         cache = str(hf_cache_dir())
         try:
             model_dir = snapshot_download(
@@ -89,7 +104,10 @@ class NllbBackend:
                 cache_dir=cache,
             )
 
-        self._tokenizer = AutoTokenizer.from_pretrained(model_dir)
+        self._tokenizer = AutoTokenizer.from_pretrained(
+            self.tokenizer_repo,
+            cache_dir=cache,
+        )
         self._translator = ctranslate2.Translator(
             model_dir,
             device=self.device,

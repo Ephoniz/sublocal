@@ -80,13 +80,13 @@ def build_parser() -> argparse.ArgumentParser:
         "extract",
         help="Extract soft subtitle tracks from video (not in v0.1).",
     )
-    extract.add_argument("args", nargs="*", help=argparse.SUPPRESS)
+    extract.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     transcribe = sub.add_parser(
         "transcribe",
         help="Transcribe audio then translate (not in v0.1).",
     )
-    transcribe.add_argument("args", nargs="*", help=argparse.SUPPRESS)
+    transcribe.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     return parser
 

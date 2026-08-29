@@ -51,7 +51,7 @@ def test_extract_stub(capsys) -> None:
 
 
 def test_transcribe_stub(capsys) -> None:
-    rc = main(["transcribe", "movie.mkv"])
+    rc = main(["transcribe", "movie.mkv", "--to", "en"])
     assert rc == 2
     assert capsys.readouterr().out.strip() == NOT_IN_V01_TRANSCRIBE
 
