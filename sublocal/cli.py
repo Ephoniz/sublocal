@@ -8,6 +8,7 @@ from sublocal import __version__
 from sublocal.detect import DetectionError
 from sublocal.formats import UnsupportedFormatError
 from sublocal.languages import UnknownLanguageError
+from sublocal.device import CudaUnavailableError, unhide_cuda_env
 from sublocal.pipeline import backend_from_name, translate_file
 from sublocal.runtime import UnsupportedPythonError
 
@@ -62,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
-        help="Inference device (default: cuda if available, else cpu)",
+        help="auto (default) uses CUDA when CTranslate2 sees a GPU; cuda requires a GPU",
     )
     tr.add_argument(
         "--batch-size",
@@ -109,6 +110,7 @@ def _cmd_translate(args: argparse.Namespace) -> int:
         DetectionError,
         UnsupportedFormatError,
         UnsupportedPythonError,
+        CudaUnavailableError,
         OSError,
         RuntimeError,
     ) as exc:
@@ -124,6 +126,8 @@ def _cmd_stub(message: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before any ctranslate2 import in this process.
+    unhide_cuda_env()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "translate":
