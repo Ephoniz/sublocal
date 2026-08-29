@@ -1,18 +1,61 @@
-"""Status lines and real tqdm bars on stderr.
+"""Status lines on stderr. Download bars are huggingface_hub tqdm.
 
-Download bars are huggingface_hub's (bytes / file counts). Cue bars use the
-same tqdm package huggingface_hub already depends on. Nothing is a fake spinner.
+Cue progress is one new line per batch (PowerShell-safe). No ``\\r`` bars
+as the only signal — Windows PowerShell eats carriage returns.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from typing import Any
 
 
 def status(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+def format_eta(seconds: float) -> str:
+    """Short remaining-time label, e.g. ``45s``, ``2m``, ``1h05m``."""
+    secs = max(0, int(seconds))
+    if secs < 60:
+        return f"{secs}s"
+    minutes, secs = divmod(secs, 60)
+    if minutes < 60:
+        return f"{minutes}m" if secs == 0 else f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+class BatchCounter:
+    """Print ``128/599 cues (21%) ~3m left`` on a new line after each batch."""
+
+    def __init__(self, total: int) -> None:
+        self.total = max(0, total)
+        self.done = 0
+        self._start = time.monotonic()
+
+    def update(self, n: int) -> None:
+        self.done = min(self.total, self.done + max(0, n))
+        if self.total == 0:
+            status("0/0 cues (100%)")
+            return
+        pct = int(self.done * 100 / self.total)
+        line = f"{self.done}/{self.total} cues ({pct}%)"
+        eta = self._eta()
+        if eta:
+            line = f"{line} ~{eta} left"
+        status(line)
+
+    def _eta(self) -> str:
+        if self.done <= 0 or self.done >= self.total:
+            return ""
+        elapsed = time.monotonic() - self._start
+        if elapsed <= 0:
+            return ""
+        remaining = (self.total - self.done) * (elapsed / self.done)
+        return format_eta(remaining)
 
 
 def enable_download_progress() -> None:
@@ -52,15 +95,3 @@ def stderr_tqdm_class() -> type:
             super().__init__(*args, **kwargs)
 
     return StderrTqdm
-
-
-def cue_bar(total: int, desc: str = "Translating"):
-    """Count cues (not text) on stderr."""
-    enable_download_progress()
-    cls = stderr_tqdm_class()
-    return cls(
-        total=total,
-        desc=desc,
-        unit="cue",
-        leave=True,
-    )

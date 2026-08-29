@@ -46,7 +46,11 @@ def test_nllb_translate_preserves_timestamps(
     # Translation should change at least some Spanish cue text.
     assert any(a.text != b.text for a, b in zip(src.cues, dst.cues))
     err = capsys.readouterr().err
+    assert "Using CPU" in err
     assert "Loading model from cache" in err
     assert "Model ready (device=cpu)" in err
-    assert "Translating" in err
+    assert "Translating 12 cues" in err
+    assert err.find("Model ready") < err.find("Translating 12 cues")
+    assert "12/12 cues (100%)" in err
+    assert "Finished batch translation" not in err
     assert "Hola, bienvenidos" not in err
