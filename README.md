@@ -32,9 +32,7 @@ sublocal translate input.srt --to en --from es --out input.en.srt
 
 `--from` is optional; source language is detected from cue text when omitted.
 
-`--device auto` (the default) uses CUDA when CTranslate2 sees a GPU. On a Windows box with an RTX 4070 Ti that is the expected path. Official CTranslate2 4.8.1 Windows wheels are CUDA-capable (`cudnn64_9.dll`). You need the **CUDA 12** runtime those wheels load (12.2 / 12.6 / 13.1 have been used).
-
-`CUDA_VISIBLE_DEVICES=-1` hides every GPU. That is a debug leftover; `auto` then used to pick CPU with no complaint. sublocal drops a hiding `-1` or empty value **in this process only** (your shell is unchanged). After that, `auto` prints `Using NVIDIA GeForce RTX 4070 Ti (cuda:0)` (or the real name) when a GPU is visible. If `get_cuda_device_count()` is still 0, it prints `Using CPU` and why, then continues. `--device cuda` exits 1 instead of faking CPU.
+`--device auto` (the default) uses CUDA when `get_cuda_device_count()` is greater than 0 and prints `Using NVIDIA GeForce RTX 4070 Ti (cuda:0)` (or the real `nvidia-smi` name). Official CTranslate2 4.8 Windows wheels dynamically load CUDA 12 (`cublas64_12.dll`, `cudart64_12.dll`); a leftover `CUDA_VISIBLE_DEVICES=-1` or empty value is dropped in this process only. If the count is still 0, stderr prints why (`CUDA_PATH` unset or pointing at v13.x, missing `cublas64_12.dll` on PATH / `CUDA_PATH\bin`) and the run continues so a file still gets written. `--device cuda` exits 1 with the same diagnostic instead of faking CPU.
 
 Progress goes to stderr: download (tqdm, extra), cache/load, `Model ready (device=cuda)` only after `Translator` is constructed, then `Translating N cues` and one **new line per batch** (`128/599 cues (21%) ~2m left`). PowerShell eats tqdm `\r` bars, so the line counter is the real signal. The output path is the only stdout line.
 

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
+from pathlib import Path
 
 from sublocal.progress import status
 
 # Values that make CUDA report zero devices. Dropped in-process only.
 _HIDING = frozenset({"", "-1"})
+_CT2_RUNTIME_DLLS = ("cublas64_12.dll", "cudart64_12.dll")
+_V13_PATH = re.compile(r"(?:^|[\\/])v13(?:\.\d+)?(?:[\\/]|$)", re.IGNORECASE)
 
 
 class CudaUnavailableError(RuntimeError):
@@ -69,16 +73,75 @@ def _cuda_label(index: int = 0) -> str:
     return f"cuda:{index}"
 
 
+def _dll_search_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        dirs.append(Path(cuda_path) / "bin")
+    for part in os.environ.get("PATH", "").split(os.pathsep):
+        if part:
+            dirs.append(Path(part))
+    return dirs
+
+
+def _find_runtime_dll(name: str) -> Path | None:
+    seen: set[Path] = set()
+    for directory in _dll_search_dirs():
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _dll_status(name: str) -> str:
+    found = _find_runtime_dll(name)
+    if found is not None:
+        return f"{name} found at {found}"
+    return f"{name} not found on PATH or CUDA_PATH\\bin"
+
+
+def _cuda_path_looks_v13(cuda_path: str) -> bool:
+    return bool(_V13_PATH.search(cuda_path.replace("/", "\\")))
+
+
 def _cuda_missing_message(*, requested: str, hidden: str | None) -> str:
     bits = [f"CTranslate2 get_cuda_device_count()=0 (--device {requested})"]
-    if hidden is not None:
-        bits.append(
-            f"after clearing hiding CUDA_VISIBLE_DEVICES={hidden!r} in-process"
-        )
+    leftover = hidden
+    if leftover is None:
+        current = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if current is not None and current.strip() in _HIDING:
+            leftover = current
+    if leftover is not None:
+        if leftover.strip() == "":
+            bits.append(
+                "leftover empty CUDA_VISIBLE_DEVICES was cleared in-process"
+            )
+        else:
+            bits.append(
+                f"after clearing hiding CUDA_VISIBLE_DEVICES={leftover!r} "
+                "in-process"
+            )
+    cuda_path = os.environ.get("CUDA_PATH")
+    if cuda_path:
+        bits.append(f"CUDA_PATH={cuda_path}")
+        if _cuda_path_looks_v13(cuda_path):
+            bits.append(
+                "CUDA_PATH looks like v13.x; the CTranslate2 4.8 wheel still "
+                "needs the CUDA 12.x bin on PATH"
+            )
+    else:
+        bits.append("CUDA_PATH is unset")
+    bits.extend(_dll_status(name) for name in _CT2_RUNTIME_DLLS)
     bits.append(
-        "Need a visible GPU and the CUDA 12 runtime the CTranslate2 wheel "
-        "loads (12.2 / 12.6 / 13.1). Official CPython only — Anaconda on "
-        "Windows still AV-crashes. CUDA_VISIBLE_DEVICES=-1 hides every GPU."
+        "Official CPython only — Anaconda on Windows still AV-crashes. "
+        "CUDA_VISIBLE_DEVICES=-1 hides every GPU."
     )
     return ". ".join(bits)
 
@@ -101,5 +164,5 @@ def resolve_device(requested: str) -> str:
     why = _cuda_missing_message(requested=requested, hidden=hidden)
     if requested == "cuda":
         raise CudaUnavailableError(why)
-    status(f"Using CPU ({why})")
+    status(why)
     return "cpu"
