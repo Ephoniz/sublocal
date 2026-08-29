@@ -1,0 +1,14 @@
+WEBVTT
+
+NOTE sample file for best-effort VTT
+
+00:00:01.000 --> 00:00:03.000
+Hola, mundo.
+
+2
+00:00:03.500 --> 00:00:05.000
+(suspiro)
+
+00:00:05.200 --> 00:00:08.000
+Línea uno
+Línea dos
