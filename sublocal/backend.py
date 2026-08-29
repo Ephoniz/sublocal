@@ -7,6 +7,7 @@ from typing import Protocol
 
 from sublocal.cache import hf_cache_dir
 from sublocal.progress import cue_bar, enable_download_progress, status, stderr_tqdm_class
+from sublocal.runtime import reject_anaconda_on_windows
 
 # Match the CLI promise: no telemetry. Must be set before huggingface_hub import.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -71,6 +72,7 @@ class NllbBackend:
         batch_size: int = 32,
         repo_id: str | None = None,
     ) -> None:
+        reject_anaconda_on_windows()
         self.device = resolve_device(device)
         self.batch_size = max(1, batch_size)
         self.repo_id = repo_id or os.environ.get(
@@ -132,6 +134,9 @@ class NllbBackend:
     def _ensure_loaded(self) -> None:
         if self._translator is not None:
             return
+        # Again immediately before Translator(); that call AV-crashes on
+        # Windows Anaconda instead of raising.
+        reject_anaconda_on_windows()
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         from transformers.utils import logging as hf_logging

@@ -9,6 +9,7 @@ from sublocal.detect import DetectionError
 from sublocal.formats import UnsupportedFormatError
 from sublocal.languages import UnknownLanguageError
 from sublocal.pipeline import backend_from_name, translate_file
+from sublocal.runtime import UnsupportedPythonError
 
 NOT_IN_V01_EXTRACT = (
     "not in v0.1: extract existing subtitle tracks from video "
@@ -107,6 +108,7 @@ def _cmd_translate(args: argparse.Namespace) -> int:
         UnknownLanguageError,
         DetectionError,
         UnsupportedFormatError,
+        UnsupportedPythonError,
         OSError,
         RuntimeError,
     ) as exc:
