@@ -9,6 +9,7 @@ from sublocal.detect import detect_iso639
 from sublocal.formats import dumps, load, save
 from sublocal.formats.base import Document
 from sublocal.languages import display_code, to_flores
+from sublocal.progress import status
 
 
 def default_output_path(inp: Path, to_code: str) -> Path:
@@ -47,6 +48,7 @@ def translate_document(
     if backend is None:
         backend = NllbBackend()
     texts = [c.text for c in cues]
+    status(f"Translating {len(texts)} cues ({src} → {tgt})")
     translated = backend.translate(texts, src, tgt)
     apply_translations(doc, translated)
     return doc, src, tgt

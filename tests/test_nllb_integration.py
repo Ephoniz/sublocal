@@ -28,7 +28,7 @@ def _nllb_cached() -> bool:
 
 @pytest.mark.skipif(not _nllb_cached(), reason="NLLB CTranslate2 weights not cached")
 def test_nllb_translate_preserves_timestamps(
-    sample_srt: Path, tmp_path: Path
+    sample_srt: Path, tmp_path: Path, capsys
 ) -> None:
     out = tmp_path / "live.en.srt"
     translate_file(
@@ -45,3 +45,8 @@ def test_nllb_translate_preserves_timestamps(
     assert [c.index for c in dst.cues] == [c.index for c in src.cues]
     # Translation should change at least some Spanish cue text.
     assert any(a.text != b.text for a, b in zip(src.cues, dst.cues))
+    err = capsys.readouterr().err
+    assert "Loading model from cache" in err
+    assert "Model ready (device=cpu)" in err
+    assert "Translating" in err
+    assert "Hola, bienvenidos" not in err
