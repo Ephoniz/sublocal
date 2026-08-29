@@ -48,7 +48,7 @@ sublocal transcribe movie.mp4 --model large-v3 --device auto
 
 Writes source-language SRT only. There is no `--to`; run `translate` yourself on the SRT if you want another language. `extract` is still a stub and is not invoked.
 
-Default model is **faster-whisper large-v3** (`Systran/faster-whisper-large-v3`) on CUDA with float16 (int8 on CPU). Audio is decoded in-process with PyAV. First run downloads ~3 GB into the same Hugging Face cache as translate if that snapshot is not already there.
+Default model is **faster-whisper large-v3** (`Systran/faster-whisper-large-v3`) on CUDA with float16 (int8 on CPU). Audio is decoded in-process with PyAV to 16 kHz mono and passed into Whisper as an array. `ffmpeg` is not required for `transcribe` (it is only for optional `extract` later). First run downloads ~3 GB into the same Hugging Face cache as translate if that snapshot is not already there.
 
 Cues are sentence-sized: word timestamps, Silero VAD at ~500 ms silence, then regroup (Japanese `。` / `？`, 0.5 s gaps, tiny-gap merge, ~32 characters / two lines). Timestamps are first-word start → last-word end, not Whisper's raw 30 s windows.
 

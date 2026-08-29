@@ -28,6 +28,7 @@ GAP_SPLIT_S = 0.5
 GAP_MERGE_S = 0.15
 VAD_MIN_SILENCE_MS = 500
 VAD_MIN_SILENCE_S = 0.5
+WHISPER_SAMPLE_RATE = 16000
 PUNCTUATION = ["。", "?", "？"]
 _BIGGER_THAN_LARGE_V3 = re.compile(
     r"large-v(?:[4-9]\d*|[1-9]\d+)", re.IGNORECASE
@@ -387,6 +388,45 @@ def write_transcript_srt(transcript: Transcript, path: Path) -> int:
     return len(doc.cues)
 
 
+def decode_audio(
+    path: str | Path, sampling_rate: int = WHISPER_SAMPLE_RATE
+) -> Any:
+    """Decode audio/video to 16 kHz mono float32 with PyAV. No ffmpeg CLI."""
+    import gc
+    import itertools
+
+    import av
+    import numpy as np
+
+    resampler = av.audio.resampler.AudioResampler(
+        format="s16",
+        layout="mono",
+        rate=sampling_rate,
+    )
+    chunks: list[Any] = []
+    try:
+        with av.open(str(path), mode="r", metadata_errors="ignore") as container:
+            audio_streams = getattr(container.streams, "audio", None)
+            if not audio_streams:
+                raise ValueError(f"No audio stream in {path}")
+            frames = _iter_audio_frames(container)
+            for frame in itertools.chain(frames, [None]):
+                for resampled in resampler.resample(frame):
+                    arr = resampled.to_ndarray()
+                    chunks.append(np.ascontiguousarray(arr).reshape(-1))
+    finally:
+        del resampler
+        gc.collect()
+    if not chunks:
+        raise ValueError(f"No audio decoded from {path}")
+    audio = np.concatenate(chunks)
+    if np.issubdtype(audio.dtype, np.integer):
+        audio = audio.astype(np.float32) / 32768.0
+    else:
+        audio = np.asarray(audio, dtype=np.float32)
+    return np.ascontiguousarray(audio.reshape(-1), dtype=np.float32)
+
+
 def load_whisper(model_size: str, device: str) -> Any:
     reject_anaconda_on_windows()
     import stable_whisper
@@ -418,16 +458,23 @@ def load_whisper(model_size: str, device: str) -> Any:
 
 def _whisper_infer(
     model: Any,
-    audio_path: Path,
+    audio: Any,
     language: str | None,
     progress_cb: Callable[[float, float], None],
 ) -> Any:
+    """Run stable-ts/faster-whisper on an in-memory waveform.
+
+    ``audio`` must be a 16 kHz mono float32 array, never a file path.
+    Passing a path makes ``WhisperResult.adjust_by_silence`` reload the
+    file through ``load_audio`` → ``ffmpeg``, which is not on PATH.
+    """
     kwargs: dict[str, Any] = {
         "word_timestamps": True,
         "verbose": None,
         "regroup": False,
         "vad_filter": True,
         "vad_parameters": dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS),
+        # Silence-adjust uses this same ndarray (no ffmpeg reload).
         "vad": True,
         "min_silence_dur": VAD_MIN_SILENCE_S,
         "progress_callback": progress_cb,
@@ -436,7 +483,7 @@ def _whisper_infer(
         kwargs["language"] = language
     transcribe = model.transcribe
     try:
-        return transcribe(str(audio_path), **kwargs)
+        return transcribe(audio, **kwargs)
     except TypeError:
         fallback = {
             k: v
@@ -455,10 +502,10 @@ def _whisper_infer(
             fallback["language"] = language
         fallback["progress_callback"] = progress_cb
         try:
-            return transcribe(str(audio_path), **fallback)
+            return transcribe(audio, **fallback)
         except TypeError:
             fallback.pop("progress_callback", None)
-            return transcribe(str(audio_path), **fallback)
+            return transcribe(audio, **fallback)
 
 
 def transcribe_file(
@@ -474,10 +521,11 @@ def transcribe_file(
     model_size = validate_model(model_size)
     out = Path(output_path) if output_path else default_output_path(inp)
     resolved = resolve_device(device)
+    waveform = decode_audio(inp)
     model = load_whisper(model_size, resolved)
     progress = SeekProgress()
     try:
-        raw = _whisper_infer(model, inp, language, progress)
+        raw = _whisper_infer(model, waveform, language, progress)
         progress.finish()
         transcript = apply_regroup(raw)
         if not any(seg.words for seg in transcript.segments):
@@ -487,6 +535,19 @@ def transcribe_file(
         return out
     finally:
         unload_whisper(model)
+
+
+def _iter_audio_frames(container: Any) -> Any:
+    import av
+
+    frames = container.decode(audio=0)
+    while True:
+        try:
+            yield next(frames)
+        except StopIteration:
+            return
+        except av.error.InvalidDataError:
+            continue
 
 
 def _as_word(w: Any) -> Word:

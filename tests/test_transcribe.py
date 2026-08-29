@@ -10,10 +10,13 @@ from sublocal.transcribe import (
     Segment,
     Transcript,
     Word,
+    _whisper_infer,
     apply_regroup,
+    decode_audio,
     default_output_path,
     format_srt_timestamp,
     transcript_to_document,
+    transcribe_file,
     validate_model,
     write_transcript_srt,
 )
@@ -152,6 +155,7 @@ def test_cli_transcribe_mocked_writes_srt(
         lambda index=0: "NVIDIA GeForce RTX 4070 Ti",
     )
     monkeypatch.setattr("sublocal.transcribe.load_whisper", lambda *a, **k: object())
+    monkeypatch.setattr("sublocal.transcribe.decode_audio", lambda path: object())
     chained: list[str] = []
     monkeypatch.setattr(
         "sublocal.pipeline.translate_file",
@@ -213,6 +217,118 @@ def test_regroup_from_plain_whisper_standin() -> None:
     assert len(doc.cues) >= 3
     assert all(" --> " in c.timing for c in doc.cues)
     assert all(not c.timing.startswith("00:00:00,000 --> 00:00:30,000") for c in doc.cues)
+
+
+def test_decode_audio_returns_1d_float32(monkeypatch, tmp_path) -> None:
+    np = pytest.importorskip("numpy")
+    import sys
+    from types import SimpleNamespace
+
+    class Frame:
+        def to_ndarray(self):
+            return np.array([[1000, -1000, 0, 500]], dtype=np.int16)
+
+    class Container:
+        streams = SimpleNamespace(audio=[object()])
+
+        def decode(self, audio=0):
+            yield Frame()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def make_resampler(**kwargs):
+        assert kwargs.get("layout") == "mono"
+        assert kwargs.get("rate") == 16000
+
+        class _Resampler:
+            def resample(self, frame):
+                if frame is None:
+                    return []
+                return [frame]
+
+        return _Resampler()
+
+    fake_av = SimpleNamespace(
+        audio=SimpleNamespace(resampler=SimpleNamespace(AudioResampler=make_resampler)),
+        error=SimpleNamespace(InvalidDataError=type("InvalidDataError", (Exception,), {})),
+        open=lambda path, mode="r", **kwargs: Container(),
+    )
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+    audio = decode_audio(tmp_path / "clip.mkv")
+    assert isinstance(audio, np.ndarray)
+    assert audio.ndim == 1
+    assert audio.dtype == np.float32
+    assert audio.size == 4
+    assert abs(float(audio[0]) - (1000 / 32768.0)) < 1e-6
+
+
+def test_decode_audio_from_generated_wav(tmp_path) -> None:
+    pytest.importorskip("av")
+    np = pytest.importorskip("numpy")
+    import struct
+    import wave
+
+    path = tmp_path / "tone.wav"
+    sr = 16000
+    n = 1600
+    with wave.open(str(path), "w") as fh:
+        fh.setnchannels(1)
+        fh.setsampwidth(2)
+        fh.setframerate(sr)
+        fh.writeframes(struct.pack("<" + "h" * n, *([1000] * n)))
+    audio = decode_audio(path)
+    assert isinstance(audio, np.ndarray)
+    assert audio.ndim == 1
+    assert audio.dtype == np.float32
+    assert abs(audio.size - n) < sr // 10
+
+
+def test_transcribe_passes_ndarray_not_path(tmp_path, monkeypatch) -> None:
+    np = pytest.importorskip("numpy")
+    dummy = tmp_path / "movie.mp4"
+    dummy.write_bytes(b"fake-media")
+    wave = np.zeros(1600, dtype=np.float32)
+    monkeypatch.setattr("sublocal.transcribe.decode_audio", lambda path: wave)
+    monkeypatch.setattr("sublocal.device.cuda_device_count", lambda: 1)
+    monkeypatch.setattr("sublocal.device.cuda_device_name", lambda index=0: "Fake GPU")
+    monkeypatch.setattr("sublocal.transcribe.load_whisper", lambda *a, **k: object())
+
+    seen: dict = {}
+
+    def fake_infer(model, audio, language, progress_cb):
+        seen["audio"] = audio
+        progress_cb(1.0, 1.0)
+        return _fake_30s_window()
+
+    monkeypatch.setattr("sublocal.transcribe._whisper_infer", fake_infer)
+    transcribe_file(dummy)
+    assert isinstance(seen["audio"], np.ndarray)
+    assert seen["audio"].dtype == np.float32
+    assert seen["audio"].ndim == 1
+    assert not isinstance(seen["audio"], (str, Path))
+
+
+def test_whisper_infer_calls_transcribe_with_ndarray() -> None:
+    np = pytest.importorskip("numpy")
+    wave = np.zeros(800, dtype=np.float32)
+    seen: dict = {}
+
+    class Model:
+        def transcribe(self, audio, **kwargs):
+            seen["audio"] = audio
+            seen["kwargs"] = kwargs
+            return _fake_30s_window()
+
+    _whisper_infer(Model(), wave, "ja", lambda *_a: None)
+    assert seen["audio"] is wave
+    assert isinstance(seen["audio"], np.ndarray)
+    assert seen["kwargs"]["vad_filter"] is True
+    assert seen["kwargs"]["vad_parameters"]["min_silence_duration_ms"] == 500
+    assert seen["kwargs"].get("vad") is True
 
 
 def test_seek_progress_throttles(monkeypatch, capsys) -> None:
