@@ -1,0 +1,49 @@
+1
+00:00:01,000 --> 00:00:03,240
+Hola, bienvenidos a la película.
+
+2
+00:00:03,500 --> 00:00:05,000
+(suspiro)
+
+3
+00:00:05,200 --> 00:00:08,800
+No lo sé.
+Esto es más complicado de lo que pensaba.
+
+4
+00:00:09,000 --> 00:00:11,500
+¿De verdad vas a salir con esta lluvia?
+
+5
+00:00:12,000 --> 00:00:14,200
+(puerta cerrándose)
+
+6
+00:00:14,500 --> 00:00:17,000
+Espera. Tengo que decirte algo importante.
+
+7
+00:00:17,400 --> 00:00:20,100
+El tren sale a las cinco
+y no vamos a llegar.
+
+8
+00:00:20,500 --> 00:00:22,800
+Tranquila, todavía tenemos tiempo.
+
+9
+00:00:23,000 --> 00:00:25,500
+(música tensa)
+
+10
+00:00:26,000 --> 00:00:29,200
+Si no lo hacemos ahora, no lo haremos nunca.
+
+11
+00:00:29,800 --> 00:00:32,000
+Está bien. Vamos.
+
+12
+00:00:32,500 --> 00:00:35,000
+Te quiero. No lo olvides.
