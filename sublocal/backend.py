@@ -6,7 +6,12 @@ import os
 from typing import Protocol
 
 from sublocal.cache import hf_cache_dir
-from sublocal.progress import cue_bar, enable_download_progress, status, stderr_tqdm_class
+from sublocal.progress import (
+    BatchCounter,
+    enable_download_progress,
+    status,
+    stderr_tqdm_class,
+)
 from sublocal.runtime import reject_anaconda_on_windows
 
 # Match the CLI promise: no telemetry. Must be set before huggingface_hub import.
@@ -31,10 +36,24 @@ class TranslatorBackend(Protocol):
 class EchoBackend:
     """Returns cue text unchanged. Used by tests; no model download."""
 
+    def prepare(self) -> None:
+        return None
+
     def translate(
         self, texts: list[str], src_flores: str, tgt_flores: str
     ) -> list[str]:
         return list(texts)
+
+
+def _quiet_ct2_debug() -> None:
+    """Keep Info (Loaded model); hide Debug (Finished batch translation)."""
+    import logging
+
+    import ctranslate2
+
+    if os.environ.get("CTRANSLATE2_LOG_LEVEL"):
+        return
+    ctranslate2.set_log_level(logging.INFO)
 
 
 def resolve_device(device: str) -> str:
@@ -43,6 +62,7 @@ def resolve_device(device: str) -> str:
     try:
         import ctranslate2
 
+        _quiet_ct2_debug()
         return "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
     except Exception:
         return "cpu"
@@ -83,6 +103,10 @@ class NllbBackend:
         )
         self._translator = None
         self._tokenizer = None
+
+    def prepare(self) -> None:
+        """Load weights (and refuse Anaconda on Windows) before cue work starts."""
+        self._ensure_loaded()
 
     def _snapshot(self, repo_id: str, cache: str, size_hint: str) -> tuple[str, bool]:
         """Return (local path, was_cached). First miss uses HF tqdm byte bars."""
@@ -142,6 +166,7 @@ class NllbBackend:
         from transformers.utils import logging as hf_logging
         import ctranslate2
 
+        _quiet_ct2_debug()
         hf_logging.set_verbosity_error()
         cache = str(hf_cache_dir())
         model_dir, model_cached = self._snapshot(
@@ -181,31 +206,32 @@ class NllbBackend:
         batch_size = self.batch_size
         total = len(texts)
         empty_count = total - len(nonempty)
-        with cue_bar(total) as bar:
-            if empty_count:
-                bar.update(empty_count)
-            for start in range(0, len(nonempty), batch_size):
-                chunk = nonempty[start : start + batch_size]
-                sources: list[list[str]] = []
-                for _, text in chunk:
-                    token_ids = tokenizer.encode(text, add_special_tokens=True)
-                    sources.append(tokenizer.convert_ids_to_tokens(token_ids))
-                results = translator.translate_batch(
-                    sources,
-                    target_prefix=[[tgt_flores]] * len(sources),
-                    beam_size=2,
-                    max_input_length=512,
-                    max_decoding_length=512,
+        counter = BatchCounter(total)
+        for start in range(0, len(nonempty), batch_size):
+            chunk = nonempty[start : start + batch_size]
+            sources: list[list[str]] = []
+            for _, text in chunk:
+                token_ids = tokenizer.encode(text, add_special_tokens=True)
+                sources.append(tokenizer.convert_ids_to_tokens(token_ids))
+            results = translator.translate_batch(
+                sources,
+                target_prefix=[[tgt_flores]] * len(sources),
+                beam_size=2,
+                max_input_length=512,
+                max_decoding_length=512,
+            )
+            for (orig_i, _), result in zip(chunk, results, strict=True):
+                hyp = list(result.hypotheses[0]) if result.hypotheses else []
+                if hyp and hyp[0] == tgt_flores:
+                    hyp = hyp[1:]
+                hyp = [tok for tok in hyp if tok not in _SKIP_TOKENS]
+                decoded = tokenizer.decode(
+                    tokenizer.convert_tokens_to_ids(hyp),
+                    skip_special_tokens=True,
                 )
-                for (orig_i, _), result in zip(chunk, results, strict=True):
-                    hyp = list(result.hypotheses[0]) if result.hypotheses else []
-                    if hyp and hyp[0] == tgt_flores:
-                        hyp = hyp[1:]
-                    hyp = [tok for tok in hyp if tok not in _SKIP_TOKENS]
-                    decoded = tokenizer.decode(
-                        tokenizer.convert_tokens_to_ids(hyp),
-                        skip_special_tokens=True,
-                    )
-                    out[orig_i] = decoded
-                bar.update(len(chunk))
+                out[orig_i] = decoded
+            n = len(chunk)
+            if start == 0 and empty_count:
+                n += empty_count
+            counter.update(n)
         return out

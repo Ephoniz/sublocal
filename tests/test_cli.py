@@ -27,6 +27,7 @@ def test_cli_translate_echo(
     captured = capsys.readouterr()
     printed = captured.out.strip()
     assert printed == str(out)
+    assert "Translating 12 cues" in captured.err
     # Progress belongs on stderr; do not dump cue text.
     assert "Hola, bienvenidos" not in captured.err
     assert "Hola, bienvenidos" not in captured.out

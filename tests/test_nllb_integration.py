@@ -48,5 +48,8 @@ def test_nllb_translate_preserves_timestamps(
     err = capsys.readouterr().err
     assert "Loading model from cache" in err
     assert "Model ready (device=cpu)" in err
-    assert "Translating" in err
+    assert "Translating 12 cues" in err
+    assert err.find("Model ready") < err.find("Translating 12 cues")
+    assert "12/12 cues (100%)" in err
+    assert "Finished batch translation" not in err
     assert "Hola, bienvenidos" not in err

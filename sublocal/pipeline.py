@@ -48,6 +48,9 @@ def translate_document(
     if backend is None:
         backend = NllbBackend()
     texts = [c.text for c in cues]
+    prepare = getattr(backend, "prepare", None)
+    if callable(prepare):
+        prepare()
     status(f"Translating {len(texts)} cues ({src} → {tgt})")
     translated = backend.translate(texts, src, tgt)
     apply_translations(doc, translated)
