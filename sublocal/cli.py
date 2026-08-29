@@ -11,14 +11,11 @@ from sublocal.languages import UnknownLanguageError
 from sublocal.device import CudaUnavailableError, unhide_cuda_env
 from sublocal.pipeline import backend_from_name, translate_file
 from sublocal.runtime import UnsupportedPythonError
+from sublocal.transcribe import transcribe_file
 
 NOT_IN_V01_EXTRACT = (
     "not in v0.1: extract existing subtitle tracks from video "
     "(ffmpeg/mkvextract). Soft subs only."
-)
-NOT_IN_V01_TRANSCRIBE = (
-    "not in v0.1: transcribe with faster-whisper, then translate "
-    "with the same pipeline."
 )
 
 
@@ -26,8 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sublocal",
         description=(
-            "Local-only subtitle translation. No cloud APIs, no API keys, "
-            "no telemetry."
+            "Local-only subtitle translation and transcription. "
+            "No cloud APIs, no API keys, no telemetry."
         ),
     )
     parser.add_argument(
@@ -86,9 +83,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     transcribe = sub.add_parser(
         "transcribe",
-        help="Transcribe audio then translate (not in v0.1).",
+        help="Transcribe audio or video to source-language SRT.",
     )
-    transcribe.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    transcribe.add_argument("input", help="Path to an audio or video file")
+    transcribe.add_argument(
+        "--language",
+        default=None,
+        metavar="LANG",
+        help="Whisper language code (e.g. ja). Detected if omitted.",
+    )
+    transcribe.add_argument(
+        "--model",
+        default="large-v3",
+        help="Whisper model size (default: large-v3). Larger models are rejected.",
+    )
+    transcribe.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="Output SRT path (default: input with .srt suffix)",
+    )
+    transcribe.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="auto (default) uses CUDA when CTranslate2 sees a GPU; cuda requires a GPU",
+    )
 
     return parser
 
@@ -120,6 +140,29 @@ def _cmd_translate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_transcribe(args: argparse.Namespace) -> int:
+    try:
+        out = transcribe_file(
+            args.input,
+            language=args.language,
+            model_size=args.model,
+            output_path=args.out,
+            device=args.device,
+        )
+    except (
+        FileNotFoundError,
+        ValueError,
+        UnsupportedPythonError,
+        CudaUnavailableError,
+        OSError,
+        RuntimeError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(out)
+    return 0
+
+
 def _cmd_stub(message: str) -> int:
     print(message)
     return 2
@@ -135,6 +178,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "extract":
         return _cmd_stub(NOT_IN_V01_EXTRACT)
     if args.command == "transcribe":
-        return _cmd_stub(NOT_IN_V01_TRANSCRIBE)
+        return _cmd_transcribe(args)
     parser.print_help()
     return 1

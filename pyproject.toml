@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sublocal"
-version = "0.1.0"
-description = "Local-only subtitle translation with small models. No cloud APIs."
+version = "0.2.0"
+description = "Local-only subtitle translation and transcription. No cloud APIs."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Maruan Aguerdouh" }]
-keywords = ["subtitles", "translation", "nllb", "ctranslate2", "offline"]
+keywords = ["subtitles", "translation", "transcription", "nllb", "whisper", "ctranslate2", "offline"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -21,10 +21,13 @@ classifiers = [
   "Topic :: Multimedia :: Video",
 ]
 dependencies = [
+  "av>=11.0.0",
   "ctranslate2>=4.0.0",
+  "faster-whisper>=1.0.0",
   "huggingface-hub>=0.23.0",
   "langdetect>=1.0.9",
   "sentencepiece>=0.2.0",
+  "stable-ts-whisperless>=2.18.0",
   "transformers>=4.40.0",
 ]
 

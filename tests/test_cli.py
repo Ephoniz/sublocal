@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sublocal.cli import NOT_IN_V01_EXTRACT, NOT_IN_V01_TRANSCRIBE, main
+from sublocal.cli import NOT_IN_V01_EXTRACT, main
 from sublocal.formats import load
 
 
@@ -53,12 +53,6 @@ def test_extract_stub(capsys) -> None:
     rc = main(["extract", "movie.mkv"])
     assert rc == 2
     assert capsys.readouterr().out.strip() == NOT_IN_V01_EXTRACT
-
-
-def test_transcribe_stub(capsys) -> None:
-    rc = main(["transcribe", "movie.mkv", "--to", "en"])
-    assert rc == 2
-    assert capsys.readouterr().out.strip() == NOT_IN_V01_TRANSCRIBE
 
 
 def test_missing_file(tmp_path: Path) -> None:

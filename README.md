@@ -1,14 +1,14 @@
 # sublocal
 
-Local-only subtitle translation with small models. No cloud APIs, no API keys, no telemetry.
+Local-only subtitle translation and transcription. No cloud APIs, no API keys, no telemetry.
 
-v0.1 translates an existing subtitle file and writes a new one. Timestamps stay as they were; only cue text is sent to the model.
+v0.2 transcribes audio or video to source-language SRT, and still translates an existing subtitle file (timestamps stay as they were; only cue text is sent to the model). `transcribe` does not call `translate`.
 
 ## Install
 
 Use **official CPython 3.11+** from [python.org](https://www.python.org/downloads/) or [uv](https://docs.astral.sh/uv/). Python 3.12 from those sources is fine.
 
-**Do not use Anaconda or Miniconda Python on Windows.** CTranslate2 hits a native access violation (`0xC0000005`) with no traceback on Anaconda 3.12.x. Official CPython 3.11 loads the same cached NLLB model. `sublocal` refuses that combo instead of crashing silently.
+**Do not use Anaconda or Miniconda Python on Windows.** CTranslate2 hits a native access violation (`0xC0000005`) with no traceback on Anaconda 3.12.x. Official CPython 3.11 loads the same cached models. `sublocal` refuses that combo instead of crashing silently.
 
 ```bash
 git clone https://github.com/Ephoniz/sublocal.git
@@ -38,25 +38,43 @@ Progress goes to stderr: download (tqdm, extra), cache/load, `Model ready (devic
 
 `.srt` is the supported format. `.vtt` and `.ass` are best-effort: timings are kept, styling may not be perfect.
 
-`extract` and `transcribe` exist as stubs and print `not in v0.1`.
+## Transcribe
+
+```bash
+sublocal transcribe movie.mp4
+sublocal transcribe movie.mp4 --language ja --out movie.srt
+sublocal transcribe movie.mp4 --model large-v3 --device auto
+```
+
+Writes source-language SRT only. There is no `--to`; run `translate` yourself on the SRT if you want another language. `extract` is still a stub and is not invoked.
+
+Default model is **faster-whisper large-v3** (`Systran/faster-whisper-large-v3`) on CUDA with float16 (int8 on CPU). Audio is decoded in-process with PyAV. First run downloads ~3 GB into the same Hugging Face cache as translate if that snapshot is not already there.
+
+Cues are sentence-sized: word timestamps, Silero VAD at ~500 ms silence, then regroup (Japanese `。` / `？`, 0.5 s gaps, tiny-gap merge, ~32 characters / two lines). Timestamps are first-word start → last-word end, not Whisper's raw 30 s windows.
+
+Progress on stderr is new flushed lines (`12/45s (26%) ~30s left`). The output path is the only stdout line. The Whisper model is unloaded after the SRT is written so a later `translate` in the same process can use the GPU.
+
+`extract` still prints `not in v0.1` and exits 2.
 
 ## Models
 
-Default: **NLLB-200 distilled 600M** through CTranslate2 (int8 on CPU, `int8_float16` on CUDA). Fits a 12 GB card.
+**Translate.** Default: **NLLB-200 distilled 600M** through CTranslate2 (int8 on CPU, `int8_float16` on CUDA). Fits a 12 GB card.
 
-First run downloads ~600 MB into the user cache (no Hugging Face token):
+Weights used: [`JustFrederik/nllb-200-distilled-600M-ct2-int8`](https://huggingface.co/JustFrederik/nllb-200-distilled-600M-ct2-int8), a CTranslate2 conversion of [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M). That model is **CC-BY-NC-4.0** (non-commercial). The CLI itself is MIT.
+
+**Transcribe.** Default: **faster-whisper large-v3** through CTranslate2 (float16 on CUDA, int8 on CPU). First-run weights: [`Systran/faster-whisper-large-v3`](https://huggingface.co/Systran/faster-whisper-large-v3).
+
+First-run downloads go into the user cache (no Hugging Face token):
 
 - Linux / macOS: `~/.cache/sublocal/huggingface/`
 - Windows: `%LOCALAPPDATA%\sublocal\huggingface\`
 - Override: `SUBLOCAL_CACHE`
 
-Weights used: [`JustFrederik/nllb-200-distilled-600M-ct2-int8`](https://huggingface.co/JustFrederik/nllb-200-distilled-600M-ct2-int8), a CTranslate2 conversion of [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M). That model is **CC-BY-NC-4.0** (non-commercial). The CLI itself is MIT.
-
 ## Roadmap
 
-1. **Translate existing subtitle files** — this release.
-2. **Extract** soft subtitle tracks from video (`ffmpeg` / `mkvextract`). Not in v0.1.
-3. **Transcribe** with faster-whisper `small` or `base`, then the same translate pipeline. Not in v0.1.
+1. **Translate existing subtitle files** — v0.1.
+2. **Extract** soft subtitle tracks from video (`ffmpeg` / `mkvextract`). Not auto-chained. Still a stub.
+3. **Transcribe** audio/video to sentence-sized SRT — this release.
 4. **Burned-in OCR** — later. Not faked.
 
-Helsinki-NLP Opus-MT (when a pair exists) may land later as a smaller per-pair option. Not in v0.1.
+Helsinki-NLP Opus-MT (when a pair exists) may land later as a smaller per-pair option.
