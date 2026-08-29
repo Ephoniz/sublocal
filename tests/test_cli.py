@@ -24,8 +24,12 @@ def test_cli_translate_echo(
         ]
     )
     assert rc == 0
-    printed = capsys.readouterr().out.strip()
+    captured = capsys.readouterr()
+    printed = captured.out.strip()
     assert printed == str(out)
+    # Progress belongs on stderr; do not dump cue text.
+    assert "Hola, bienvenidos" not in captured.err
+    assert "Hola, bienvenidos" not in captured.out
     src = load(sample_srt)
     dst = load(out)
     assert len(dst.cues) == len(src.cues)

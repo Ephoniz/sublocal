@@ -30,6 +30,8 @@ sublocal translate input.srt --to en --from es --out input.en.srt
 
 `--from` is optional; source language is detected from cue text when omitted.
 
+Progress (first-run download bars, cache/load, cue counts) goes to stderr. The output path is printed on stdout when the file is written.
+
 `.srt` is the supported format. `.vtt` and `.ass` are best-effort: timings are kept, styling may not be perfect.
 
 `extract` and `transcribe` exist as stubs and print `not in v0.1`.

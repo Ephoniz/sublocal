@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import os
-import sys
 from typing import Protocol
 
 from sublocal.cache import hf_cache_dir
+from sublocal.progress import cue_bar, enable_download_progress, status, stderr_tqdm_class
 
 # Match the CLI promise: no telemetry. Must be set before huggingface_hub import.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
@@ -51,6 +51,17 @@ def _compute_type(device: str) -> str:
     return "int8_float16" if device == "cuda" else "int8"
 
 
+def _local_entry_error() -> type[Exception]:
+    try:
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        return LocalEntryNotFoundError
+    except ImportError:  # huggingface_hub < 1.0
+        from huggingface_hub.utils import LocalEntryNotFoundError
+
+        return LocalEntryNotFoundError
+
+
 class NllbBackend:
     """NLLB-200 distilled 600M, CTranslate2 int8, downloaded on first use."""
 
@@ -71,48 +82,80 @@ class NllbBackend:
         self._translator = None
         self._tokenizer = None
 
+    def _snapshot(self, repo_id: str, cache: str, size_hint: str) -> tuple[str, bool]:
+        """Return (local path, was_cached). First miss uses HF tqdm byte bars."""
+        from huggingface_hub import snapshot_download
+
+        missing = _local_entry_error()
+        try:
+            path = snapshot_download(
+                repo_id=repo_id,
+                cache_dir=cache,
+                local_files_only=True,
+            )
+            return path, True
+        except missing:
+            enable_download_progress()
+            status(
+                f"Downloading {repo_id} ({size_hint}) into {cache}. "
+                "No Hugging Face token required."
+            )
+            path = snapshot_download(
+                repo_id=repo_id,
+                cache_dir=cache,
+                tqdm_class=stderr_tqdm_class(),
+            )
+            return path, False
+
+    def _load_tokenizer(self, cache: str) -> tuple[object, bool]:
+        from transformers import AutoTokenizer
+
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                self.tokenizer_repo,
+                cache_dir=cache,
+                local_files_only=True,
+            )
+            return tok, True
+        except Exception:
+            enable_download_progress()
+            status(
+                f"Downloading tokenizer {self.tokenizer_repo} into {cache}. "
+                "No Hugging Face token required."
+            )
+            tok = AutoTokenizer.from_pretrained(
+                self.tokenizer_repo,
+                cache_dir=cache,
+            )
+            return tok, False
+
     def _ensure_loaded(self) -> None:
         if self._translator is not None:
             return
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-        from huggingface_hub import snapshot_download
         from transformers.utils import logging as hf_logging
+        import ctranslate2
 
         hf_logging.set_verbosity_error()
-        from transformers import AutoTokenizer
-        import ctranslate2
-        import logging
-
-        logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
         cache = str(hf_cache_dir())
-        try:
-            model_dir = snapshot_download(
-                repo_id=self.repo_id,
-                cache_dir=cache,
-                local_files_only=True,
-            )
-        except Exception:
-            print(
-                f"First run: downloading {self.repo_id} "
-                f"(CTranslate2 int8, ~600 MB) into {cache}. "
-                "No Hugging Face token required.",
-                file=sys.stderr,
-            )
-            model_dir = snapshot_download(
-                repo_id=self.repo_id,
-                cache_dir=cache,
-            )
-
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            self.tokenizer_repo,
-            cache_dir=cache,
+        model_dir, model_cached = self._snapshot(
+            self.repo_id, cache, size_hint="CTranslate2 int8, ~600 MB"
         )
+        tokenizer, tok_cached = self._load_tokenizer(cache)
+
+        if model_cached and tok_cached:
+            status(f"Loading model from cache ({self.repo_id})")
+        else:
+            status("Loading model")
+
+        self._tokenizer = tokenizer
         self._translator = ctranslate2.Translator(
             model_dir,
             device=self.device,
             compute_type=_compute_type(self.device),
         )
+        status(f"Model ready (device={self.device})")
 
     def translate(
         self, texts: list[str], src_flores: str, tgt_flores: str
@@ -131,27 +174,33 @@ class NllbBackend:
             return out
 
         batch_size = self.batch_size
-        for start in range(0, len(nonempty), batch_size):
-            chunk = nonempty[start : start + batch_size]
-            sources: list[list[str]] = []
-            for _, text in chunk:
-                token_ids = tokenizer.encode(text, add_special_tokens=True)
-                sources.append(tokenizer.convert_ids_to_tokens(token_ids))
-            results = translator.translate_batch(
-                sources,
-                target_prefix=[[tgt_flores]] * len(sources),
-                beam_size=2,
-                max_input_length=512,
-                max_decoding_length=512,
-            )
-            for (orig_i, _), result in zip(chunk, results, strict=True):
-                hyp = list(result.hypotheses[0]) if result.hypotheses else []
-                if hyp and hyp[0] == tgt_flores:
-                    hyp = hyp[1:]
-                hyp = [tok for tok in hyp if tok not in _SKIP_TOKENS]
-                decoded = tokenizer.decode(
-                    tokenizer.convert_tokens_to_ids(hyp),
-                    skip_special_tokens=True,
+        total = len(texts)
+        empty_count = total - len(nonempty)
+        with cue_bar(total) as bar:
+            if empty_count:
+                bar.update(empty_count)
+            for start in range(0, len(nonempty), batch_size):
+                chunk = nonempty[start : start + batch_size]
+                sources: list[list[str]] = []
+                for _, text in chunk:
+                    token_ids = tokenizer.encode(text, add_special_tokens=True)
+                    sources.append(tokenizer.convert_ids_to_tokens(token_ids))
+                results = translator.translate_batch(
+                    sources,
+                    target_prefix=[[tgt_flores]] * len(sources),
+                    beam_size=2,
+                    max_input_length=512,
+                    max_decoding_length=512,
                 )
-                out[orig_i] = decoded
+                for (orig_i, _), result in zip(chunk, results, strict=True):
+                    hyp = list(result.hypotheses[0]) if result.hypotheses else []
+                    if hyp and hyp[0] == tgt_flores:
+                        hyp = hyp[1:]
+                    hyp = [tok for tok in hyp if tok not in _SKIP_TOKENS]
+                    decoded = tokenizer.decode(
+                        tokenizer.convert_tokens_to_ids(hyp),
+                        skip_special_tokens=True,
+                    )
+                    out[orig_i] = decoded
+                bar.update(len(chunk))
         return out
