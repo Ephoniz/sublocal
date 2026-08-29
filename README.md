@@ -6,7 +6,11 @@ v0.1 translates an existing subtitle file and writes a new one. Timestamps stay 
 
 ## Install
 
-Python 3.11+. GPU is optional (CUDA via CTranslate2). CPU works.
+Use **official CPython 3.11+** from [python.org](https://www.python.org/downloads/) or [uv](https://docs.astral.sh/uv/). Python 3.12 from those sources is fine.
+
+**Do not use Anaconda or Miniconda Python on Windows.** CTranslate2 hits a native access violation (`0xC0000005`) with no traceback on Anaconda 3.12.x. The same cached NLLB model loads on official CPython 3.11.4 (CPU). `sublocal` refuses to load the translator on that combo instead of crashing silently.
+
+GPU is optional (CUDA via CTranslate2). CPU works.
 
 ```bash
 git clone https://github.com/Ephoniz/sublocal.git
