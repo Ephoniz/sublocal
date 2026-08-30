@@ -2,7 +2,7 @@
 
 Local-only subtitle translation and transcription. No cloud APIs, no API keys, no telemetry.
 
-v0.5 is one command: transcribe mixed-language audio/video, stamp a language on each cue, unload Whisper, then **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF per cue via llama-cpp-python CUDA.
+v0.6 is one command: transcribe mixed-language audio/video, stamp a language on each cue, unload Whisper, then **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF per cue via llama-cpp-python CUDA. A CPU GiNZA pass finds Person surfaces (not GemmaX2 NER). Those names are Hepburn-replaced **in a copy** of the Japanese (`野崎をマーク` → `Nozakiをマーク`) before the official completion prompt. Opaque `xxNxx` sentinels are not used on the MT path.
 
 ```bash
 sublocal clip.mp4 --to es
@@ -10,7 +10,7 @@ sublocal clip.mp4 --to es
 
 The end result is `clip.es.srt` (the overlay file); `clip.cues.jsonl` is an optional lang sidecar for debug (`start`, `end`, `text`, `lang`), not the overlay. No `--language` required. Whisper `task=translate` is never the Spanish path.
 
-NLLB is no longer the default. `--glossary` is still opt-in. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese (or other non-Latin) cue are copied through and not sent to the model (Liu/Zhang stay Latin). Kanji names: first-pass official GemmaX prompt only; no NER.
+NLLB is no longer the default. `--glossary` YAML is still opt-in extra and is merged longest-first with the file-extracted map. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese cue stay in the sentence (Liu/Zhang). GiNZA **Person** / `N_Person` surfaces (plus speaker brackets) are romanized with pykakasi Hepburn (`野崎` → `Nozaki`) inside the Japanese copy. Place/org surfaces (別班, バンコク) stay Japanese. Not from asking GemmaX2 to list names, and not from stuffing a glossary into the official prompt.
 
 `sublocal transcribe` and `sublocal translate in.srt --to es` stay as debug commands.
 
@@ -45,6 +45,16 @@ pip install ".[lid]"
 # if pip reports a regex conflict:
 pip install --no-deps lingua-language-detector==1.4.2
 ```
+
+File-local Japanese names (optional, CPU, extra VRAM ~0):
+
+```bash
+pip install ".[ja]"
+```
+
+That extra is `ginza` + `ja-ginza` (not `ja_ginza_electra`). `pykakasi` is a core dep (2.3.x has no `__version__`). Without `[ja]`, speaker brackets and Latin copy-through still run; GiNZA entities are skipped.
+
+`spacy.load("ja_ginza")` needs `config={"components": {"compound_splitter": {"split_mode": "A"}}}` (ginza 5.2.0 / ja_ginza 5.2.0). Labels are `Person` / `Place` / `N_Person` — not spaCy `PERSON`/`GPE`. `Government` (公安) is ignored.
 
 Dev / tests:
 
@@ -87,11 +97,13 @@ sublocal translate input.srt --to es --model q6
 
 ## Translate details
 
-Default model is **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF through llama-cpp-python (`n_gpu_layers=-1`, `n_ctx=2048`; CUDA OOM retries once with `n_ctx=1024` before considering `--model q6`). Generation is greedy (`temperature=0`, `top_k=1`, `max_tokens=256`). Sequential: one cue at a time. The MT pass logs elapsed seconds on stderr (hundreds of cues take minutes).
+Default model is **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF through llama-cpp-python (`n_gpu_layers=-1`, `n_ctx=2048`; CUDA OOM retries once with `n_ctx=1024` before considering `--model q6`). Generation is **completion only** (`create_completion`, never `create_chat_completion`; `chat_format` is cleared so a Gemma2 GGUF cannot wrap the official string). Greedy (`temperature=0`, `top_k=1`). `max_tokens=min(256, n_ctx - prompt_tokens)` — llama-cpp's default of 16 is why a cue can die at “Nozaki es”. If `finish_reason` is `length`, that cue retries once with up to 512. Sequential: one cue at a time. Do not prepend the whole script.
 
-`--from` is optional. `--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). It is never loaded unless you pass `--glossary`. There is no default `drama.yml` and no genre-tuned prompt.
+The MT pass logs on stderr: GiNZA entity count, in-source Person Hepburn count, `finish_reason` tallies (stop vs length), leftover `→` count (ES after source caption arrows were stripped; source-copy JP does not count), leave-JP count, and elapsed seconds.
 
-Latin/ASCII already in a non-Latin cue (`Liu`, `Zhang`, `Drum`) is copied through and not sent to the model. Kanji/kana names are left to the official GemmaX2 prompt. No NER, no cutlet/pykakasi. An optional name sentence (`Keep person and place names. …`) exists as `name_hint=False` on the backend and is off in v0.5.0.
+`--from` is optional. `--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). It is never loaded unless you pass `--glossary`. There is no default `drama.yml` and no genre-tuned prompt. The official completion prompt is unchanged — no Hepburn instructions, no name list.
+
+Before MT: peel leading `《》`/`【】`/`（）` speakers (honorifics `さん`/`くん`/`ちゃん` are not the name), strip leading/trailing caption arrows (`→` `←` `➡` `⇒`, not a llama stop), then longest-first **CJK Person** Hepburn in the body (`野崎をマーク` → `Nozakiをマーク`; never latin `file` / `Liu`). Empty body after peel+strip emits `(Nozaki)` / `(Sano)` and skips GemmaX2. Else one official completion (`max_tokens=256`, stop `Japanese:` / `Translate this` / blank line only). Prefix the speaker after. If that call is empty or majority-JP, leave Japanese — no retry. Closed-set overlay: Nagasaki → Nozaki iff the source had 野崎. The SRT is always written. GiNZA will miss some names (Lemoine/Chaki may stay wrong). Accepted.
 
 `--device auto` (the default) uses CUDA when `get_cuda_device_count()` is greater than 0 and prints `Using NVIDIA GeForce RTX 4070 Ti (cuda:0)` (or the real `nvidia-smi` name). Official CTranslate2 4.8 Windows wheels dynamically load CUDA 12 (`cublas64_12.dll`, `cudart64_12.dll`); a leftover `CUDA_VISIBLE_DEVICES=-1` or empty value is dropped in this process only. If the count is still 0, stderr prints why (`CUDA_PATH` unset or pointing at v13.x, missing `cublas64_12.dll` on PATH / `CUDA_PATH\bin`) and the run continues so a file still gets written. `--device cuda` exits 1 with the same diagnostic instead of faking CPU.
 
@@ -142,7 +154,8 @@ First-run downloads go into the user cache (no Hugging Face token):
 3. **Transcribe** audio/video to sentence-sized SRT — v0.2.
 4. **Translate default 3.3B + glossary** — v0.3.
 5. **One-command mixed-language → target SRT** — v0.4.
-6. **GemmaX2-28-9B GGUF default MT** — this release.
-7. **Burned-in OCR** — later. Not faked.
+6. **GemmaX2-28-9B GGUF default MT** — v0.5.
+7. **File-local GiNZA glossary + completion max_tokens 256** — this release.
+8. **Burned-in OCR** — later. Not faked.
 
 Helsinki-NLP Opus-MT (when a pair exists) may land later as a smaller per-pair option.

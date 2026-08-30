@@ -10,23 +10,18 @@ from sublocal.backend import (
     GemmaXBackend,
     NllbBackend,
     TranslatorBackend,
+    leftover_arrow_count,
+    strip_caption_arrows,
 )
 from sublocal.cues_jsonl import cues_jsonl_path, langs_from_sidecar, write_cues_jsonl
 from sublocal.detect import DetectionError, detect_iso639
-from sublocal.formats import dumps, load, save
+from sublocal.extract import extract_file_glossary, merge_mappings, pykakasi_version
+from sublocal.formats import load, save
 from sublocal.formats.base import Cue, Document
-from sublocal.glossary import (
-    Glossary,
-    as_glossary,
-    has_cjk,
-    needs_nllb,
-)
+from sublocal.glossary import Glossary, as_glossary, is_majority_jp
 from sublocal.languages import display_code, to_flores
 from sublocal.lid import (
     detect_cue_lang,
-    is_latin_script,
-    protect_latin_names,
-    restore_latin_names,
     same_language,
     script_heuristic,
 )
@@ -107,8 +102,8 @@ def translate_document(
     """Translate cue text in-place. Returns (doc, src_flores, tgt_flores).
 
     Each cue is encoded with that cue's source language. Cues already in
-    ``to_code`` are copied through. Latin/ASCII tokens in non-Latin cues
-    are not sent through the MT backend.
+    ``to_code`` are copied through. One official completion per cue after
+    peel + caption-arrow strip + CJK Person Hepburn. No retry happy path.
     """
     cues = doc.cues
     if not cues:
@@ -118,14 +113,24 @@ def translate_document(
     tgt = to_flores(to_code)
     if backend is None:
         backend = GemmaXBackend()
-    gloss = as_glossary(glossary)
+    yaml_gloss = as_glossary(glossary)
     texts = [c.text for c in cues]
+    src_original = list(texts)
+    file_map, ginza_count, file_persons = extract_file_glossary(
+        texts, langs, load=True
+    )
+    yaml_map = dict(yaml_gloss.mapping) if yaml_gloss is not None else {}
+    yaml_persons = set(yaml_gloss.person_keys) if yaml_gloss is not None else set()
+    merged = merge_mappings(file_map, yaml_map)
+    person_keys = set(file_persons) | yaml_persons
+    gloss = Glossary(merged, person_keys=person_keys) if merged else None
+    status(f"GiNZA entities {ginza_count} (pykakasi {pykakasi_version()})")
+
     translated: list[str | None] = [None] * len(texts)
-    # src_flores → list of cue indices to send
     groups: dict[str, list[int]] = {}
-    source_by_i: list[str] = [""] * len(texts)
-    latin_by_i: list[list[str]] = [[] for _ in texts]
     speaker_prefix: list[str | None] = [None] * len(texts)
+    left_jp: list[bool] = [False] * len(texts)
+    hepburn_count = 0
 
     for i, text in enumerate(texts):
         src_iso = langs[i]
@@ -133,39 +138,36 @@ def translate_document(
             translated[i] = text
             continue
         src = to_flores(src_iso)
-        work = text
         if gloss is not None:
-            speaker_jp, rest = gloss.peel_speaker(work)
-            if speaker_jp is not None:
-                speaker_prefix[i] = f"({gloss.mapping[speaker_jp]})"
-                if not has_cjk(rest):
-                    translated[i] = speaker_prefix[i] or ""
-                    continue
-                work = rest
-            guarded, pairs = gloss.protect(work)
-            if pairs and not needs_nllb(guarded):
-                restored = gloss.restore(guarded, pairs, target="value")
-                body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
-                translated[i] = _with_speaker(speaker_prefix[i], body)
+            prefix, body = gloss.prepare_mt_body(text)
+            speaker_prefix[i] = prefix
+            if not body.strip():
+                translated[i] = prefix or ""
                 continue
-        source_by_i[i] = work
-        send = work
-        if not is_latin_script(src):
-            send, latin_by_i[i] = protect_latin_names(work)
+            send = body
+            if send != text:
+                hepburn_count += 1
+        else:
+            send = strip_caption_arrows(text)
         groups.setdefault(src, []).append(i)
-        texts[i] = send  # what we actually send
+        texts[i] = send
+
+    status(f"in-source Person Hepburn {hepburn_count}")
 
     send_count = sum(len(idx) for idx in groups.values())
     prepare = getattr(backend, "prepare", None)
     if callable(prepare) and send_count:
         prepare()
 
+    leave_jp = 0
+
     if not groups:
-        apply_translations(doc, [t if t is not None else "" for t in translated])
+        finals = [t if t is not None else "" for t in translated]
+        apply_translations(doc, finals)
+        _log_mt_stats(backend, finals, elapsed=None, leave_jp=leave_jp, left_jp=left_jp)
         src_display = to_flores(langs[0]) if langs else tgt
         return doc, src_display, tgt
 
-    # One status line; keep the old shape when every cue shares a source.
     if len(groups) == 1:
         only_src = next(iter(groups))
         status(f"Translating {send_count} cues ({only_src} → {tgt})")
@@ -181,31 +183,58 @@ def translate_document(
                 f"Translator returned {len(batch)} texts for {len(to_send)} cues."
             )
         for j, i in enumerate(idxs):
-            mt = batch[j]
-            if latin_by_i[i]:
-                mt = restore_latin_names(mt, latin_by_i[i])
+            body = batch[j]
+            original = src_original[i]
             if gloss is not None:
-                source = source_by_i[i]
-                body = gloss.overlay_names(source, mt)
-                latins = [v for k, v in gloss.entries if k in source]
-                if latins:
-                    body = gloss.cleanup_adjacent(body, latins)
-                translated[i] = _with_speaker(speaker_prefix[i], body)
-            else:
-                translated[i] = mt
-    status(f"MT pass {time.monotonic() - started:.1f}s")
-
-    apply_translations(doc, [t if t is not None else "" for t in translated])
+                body = gloss.overlay_names(original, body)
+            if not body.strip() or is_majority_jp(body):
+                status(f"Cue {i + 1}: empty or majority-JP; leave JP (no retry)")
+                leave_jp += 1
+                left_jp[i] = True
+                translated[i] = original
+                continue
+            if speaker_prefix[i]:
+                body = (
+                    speaker_prefix[i]
+                    if not body
+                    else f"{speaker_prefix[i]} {body}"
+                )
+            translated[i] = body
+    elapsed = time.monotonic() - started
+    finals = [t if t is not None else "" for t in translated]
+    apply_translations(doc, finals)
+    _log_mt_stats(
+        backend, finals, elapsed=elapsed, leave_jp=leave_jp, left_jp=left_jp
+    )
     first_src = to_flores(langs[0]) if langs else tgt
     return doc, first_src, tgt
 
 
-def _with_speaker(prefix: str | None, body: str) -> str:
-    if not prefix:
-        return body
-    if not body:
-        return prefix
-    return f"{prefix} {body}"
+def _log_mt_stats(
+    backend: object,
+    texts: list[str],
+    *,
+    elapsed: float | None,
+    leave_jp: int = 0,
+    left_jp: list[bool] | None = None,
+) -> None:
+    counts = getattr(backend, "finish_reason_counts", None)
+    stop = 0
+    length = 0
+    if counts is not None:
+        stop = int(counts.get("stop", 0))
+        length = int(counts.get("length", 0))
+    status(f"finish_reason stop={stop} length={length}")
+    flags = left_jp or [False] * len(texts)
+    arrows = 0
+    for text, copied in zip(texts, flags, strict=False):
+        if copied:
+            continue
+        arrows += leftover_arrow_count(text)
+    status(f"leftover arrows {arrows}")
+    status(f"leave JP {leave_jp} (empty or majority-JP; no retry)")
+    if elapsed is not None:
+        status(f"MT pass {elapsed:.1f}s")
 
 
 def translate_file(

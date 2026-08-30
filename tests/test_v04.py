@@ -278,11 +278,11 @@ def test_copy_through_if_cue_lang_equals_to(tmp_path: Path) -> None:
 
     class Mangle(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
-            return [f"MT({t})" for t in texts]
+            return ["Hola a todos" for _ in texts]
 
     translate_document(doc, to_code="es", backend=Mangle())
     assert doc.cues[0].text == "Already Spanish"
-    assert doc.cues[1].text.startswith("MT(")
+    assert doc.cues[1].text == "Hola a todos"
 
 
 def test_script_heuristic_hiragana_hangul_latin() -> None:
@@ -320,9 +320,8 @@ def test_latin_ascii_names_in_jp_cue_not_sent_to_mt(tmp_path: Path) -> None:
     doc.cues[0].extra["lang"] = "ja"
     translate_document(doc, to_code="es", backend=Recorder())
     assert sent
-    assert all("Drum" not in t for t in sent)
-    assert "Drum" in doc.cues[0].text
-    assert "tambor" not in doc.cues[0].text.lower()
+    assert any("Drum" in t for t in sent)
+    assert all("xx0xx" not in t for t in sent)
 
     guarded, names = protect_latin_names("野崎とDrumです")
     assert "Drum" in names
@@ -368,14 +367,14 @@ def test_jsonl_sidecar_roundtrip(tmp_path: Path, monkeypatch) -> None:
 
         def translate(self, texts, src_flores, tgt_flores):
             self.srcs.append(src_flores)
-            return [f"ES:{t}" for t in texts]
+            return ["Hola" for _ in texts]
 
     backend = Recorder()
     out = translate_file(srt, to_code="es", output_path=tmp_path / "clip.es.srt", backend=backend)
     dst = load(out)
     assert "jpn_Jpan" in backend.srcs
     assert "eng_Latn" in backend.srcs
-    assert all(c.text.startswith("ES:") for c in dst.cues)
+    assert all(c.text == "Hola" for c in dst.cues)
 
 
 def test_product_cli_parses_media_to() -> None:
