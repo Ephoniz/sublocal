@@ -16,9 +16,10 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Literal
 
+from sublocal.backend import strip_caption_arrows
 from sublocal.extract import (
     NON_PERSON_KEYS,
-    extract_speakers,
+    honorific_stem,
     is_generic_noun,
     is_in_source_person_key,
 )
@@ -37,6 +38,9 @@ _NAMES_ONLY_PUNCT_RE = re.compile(
     r"[→\-–—\(\)\[\]《》【】<>\"'\s\.,;:!?。、，＋+…/／]"
 )
 _SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
+_LEADING_GUILLEMET_NAME_RE = re.compile(r"^《([^》]+)》\s*")
+_LEADING_LENTICULAR_NAME_RE = re.compile(r"^【([^】]+)】\s*")
+_TRAILING_ELLIPSIS_RE = re.compile(r"(…|\.{3}|⋯)$")
 _LATIN_NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'.-]*")
 _WRAPPERS = "《》＜＞「」『』"
 _PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい", "よう")
@@ -96,27 +100,98 @@ def leftover_jp_char_count(text: str) -> int:
     return len(_JP_ANY_RE.findall(text))
 
 
-def peel_leading_speakers(text: str, person_keys: Iterable[str]) -> str:
-    """Strip a full-cue 《》/【】 wrap, then leading Person ``（Name）`` tags.
+def is_majority_jp(text: str) -> bool:
+    """True when Japanese letters are at least half of non-space chars."""
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    return leftover_jp_char_count(text) * 2 >= len(compact)
 
-    ``《（野崎）この中に…》`` → ``この中に…``. Does not delete a dialogue body.
+
+def _speaker_stem(inner: str, person_keys: Iterable[str]) -> str | None:
+    """Honorifics are not the name: ``野崎さん`` → ``野崎``."""
+    key = inner.strip()
+    stem = honorific_stem(key) or key
+    keys = {k for k in person_keys if k}
+    if keys and stem in keys:
+        return stem
+    if is_in_source_person_key(stem):
+        return stem
+    return None
+
+
+def is_clause_body(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    if leftover_jp_char_count(text) >= MIN_SENTENCE_JP_CHARS:
+        return True
+    if _JP_VERB_RE.search(text):
+        return True
+    return len(compact) >= 4
+
+
+def strip_trailing_ellipsis_if_clause(text: str) -> str:
+    """Lone trailing ``…`` only when the rest is already a clause."""
+    out = text.strip()
+    match = _TRAILING_ELLIPSIS_RE.search(out)
+    if not match:
+        return out
+    rest = out[: match.start()].rstrip()
+    if is_clause_body(rest):
+        return rest
+    return out
+
+
+def peel_speakers_and_body(
+    text: str, person_keys: Iterable[str]
+) -> tuple[list[str], str]:
+    """Peel leading ``《…》`` ``【…】`` ``（…）`` ``(…)``. Return stems + body.
+
+    ``《野崎さん》`` → ``(["野崎"], "")``. ``《（野崎）この中に…》`` keeps the clause.
     """
     rest = text.strip()
+    speakers: list[str] = []
     if len(rest) >= 2:
         pairs = (("《", "》"), ("【", "】"))
         for opener, closer in pairs:
             if rest.startswith(opener) and rest.endswith(closer) and rest.count(opener) == 1:
                 rest = rest[len(opener) : -len(closer)].strip()
                 break
-    keys = {k for k in person_keys if k}
     while True:
         match = _SPEAKER_RE.match(rest)
-        if not match:
-            break
-        inner = match.group(1).strip()
-        if keys and inner not in keys and not is_in_source_person_key(inner):
-            break
-        rest = rest[match.end() :].strip()
+        if match:
+            stem = _speaker_stem(match.group(1), person_keys)
+            if stem:
+                speakers.append(stem)
+                rest = rest[match.end() :].strip()
+                continue
+        match = _LEADING_GUILLEMET_NAME_RE.match(rest)
+        if match:
+            stem = _speaker_stem(match.group(1), person_keys)
+            inner = match.group(1).strip()
+            if stem and leftover_jp_char_count(inner) < MIN_SENTENCE_JP_CHARS:
+                speakers.append(stem)
+                rest = rest[match.end() :].strip()
+                continue
+        match = _LEADING_LENTICULAR_NAME_RE.match(rest)
+        if match:
+            stem = _speaker_stem(match.group(1), person_keys)
+            inner = match.group(1).strip()
+            if stem and leftover_jp_char_count(inner) < MIN_SENTENCE_JP_CHARS:
+                speakers.append(stem)
+                rest = rest[match.end() :].strip()
+                continue
+        break
+    stem = _speaker_stem(rest, person_keys)
+    if stem and leftover_jp_char_count(honorific_stem(rest) or rest) < MIN_SENTENCE_JP_CHARS:
+        if leftover_jp_char_count(rest.replace(stem, "").replace("さん", "").replace("くん", "").replace("ちゃん", "").replace("様", "")) == 0:
+            speakers.append(stem)
+            rest = ""
+    return speakers, rest
+
+
+def peel_leading_speakers(text: str, person_keys: Iterable[str]) -> str:
+    """Body after peeling leading speaker wraps. Dialogue is kept."""
+    _speakers, rest = peel_speakers_and_body(text, person_keys)
     return rest
 
 
@@ -228,10 +303,9 @@ class Glossary:
         return {self.mapping[key] for key in self.person_keys if key in self.mapping}
 
     def hepburn_in_source(self, text: str) -> str:
-        """Copy ``text`` and replace Person surfaces longest-first with Latin.
+        """Copy ``text`` and replace CJK Person surfaces longest-first.
 
-        ``野崎をマーク`` → ``Nozakiをマーク``. Does not touch ``src_original``.
-        Does not romanize non-Person (別班 stays Japanese).
+        ``野崎をマーク`` → ``Nozakiをマーク``. Never latin ``file`` / ``Liu``.
         """
         out = text
         for key, value in self.entries:
@@ -239,48 +313,44 @@ class Glossary:
                 continue
             if key in NON_PERSON_KEYS or is_generic_noun(key):
                 continue
+            if not _JP_ANY_RE.search(key):
+                continue
             out = out.replace(key, value)
         return out
 
-    def speaker_tag_if_no_sentence(self, text: str) -> str | None:
-        """If leftover JP after speakers+Person is < 4 chars, emit a tag.
-
-        ``（佐野）`` → ``(Sano)``. Bare ``野崎`` → ``Nozaki``.
-        ``野崎をマークしていた`` is a sentence (verb) and returns None.
-        """
-        speakers = extract_speakers(text, confirmed=self.person_keys)
-        leftover = leftover_after_speakers_and_persons(text, self.person_keys)
-        stripped_name = bool(speakers) or any(key in text for key in self.person_keys)
-        if not stripped_name:
-            return None
-        if leftover_jp_char_count(leftover) >= MIN_SENTENCE_JP_CHARS:
-            return None
-        if _JP_VERB_RE.search(leftover):
-            return None
+    def speaker_prefix(self, speakers: list[str]) -> str | None:
         tags: list[str] = []
         seen: set[str] = set()
         for jp in speakers:
-            if jp not in self.mapping:
+            latin = self.mapping.get(jp)
+            if not latin:
                 continue
-            latin = self.mapping[jp]
             token = f"({latin})"
             if token not in seen:
                 tags.append(token)
                 seen.add(token)
-        rest = peel_leading_speakers(text, self.person_keys)
-        for key, value in self.entries:
-            if key not in self.person_keys or key not in rest:
-                continue
-            token = value if not speakers else f"({value})"
-            if speakers and value not in seen and f"({value})" not in seen:
-                tags.append(value)
-                seen.add(value)
-            elif not speakers and value not in seen:
-                tags.append(value)
-                seen.add(value)
         if not tags:
             return None
         return " ".join(tags)
+
+    def prepare_mt_body(self, text: str) -> tuple[str | None, str]:
+        """Peel speakers, strip caption arrows, Hepburn CJK Person.
+
+        Empty body → speaker tag only, no MT. Body has no ``→``.
+        """
+        speakers, body = peel_speakers_and_body(text, self.person_keys)
+        body = strip_caption_arrows(body)
+        body = strip_trailing_ellipsis_if_clause(body)
+        body = self.hepburn_in_source(body)
+        prefix = self.speaker_prefix(speakers)
+        return prefix, body
+
+    def speaker_tag_if_no_sentence(self, text: str) -> str | None:
+        """Empty body after peel+arrow-strip → ``(Nozaki)`` / ``(Sano)``."""
+        prefix, body = self.prepare_mt_body(text)
+        if body.strip():
+            return None
+        return prefix
 
     def peel_speaker(self, text: str) -> tuple[str | None, str]:
         """If the cue starts with optional 《＜「『 then （glossary-name）.

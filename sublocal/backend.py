@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +50,9 @@ OOM_N_CTX = 1024
 DEFAULT_MAX_TOKENS = 256
 LENGTH_RETRY_MAX_TOKENS = 512
 # llama-cpp-python create_completion default is 16 — that truncates cues.
-ARROW_MARKERS = ("→", "->", "⇒")
+# Caption continuation (TV next-cue), not a prompt-leak marker. Do not put in stop.
+CAPTION_ARROWS = ("→", "←", "➡", "⇒", "￫")
+ARROW_MARKERS = CAPTION_ARROWS
 
 
 @dataclass(frozen=True)
@@ -147,16 +150,10 @@ def gemmax_prompt(
     )
 
 
-def gemmax_stop_sequences(src_name: str) -> list[str]:
-    """Stop the model from starting a new official-prompt example."""
-    stops = [f"\n{src_name}:", "\nJapanese:", "\nTranslate this", "\n\n"]
-    seen: set[str] = set()
-    out: list[str] = []
-    for item in stops:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
+def gemmax_stop_sequences(src_name: str | None = None) -> list[str]:
+    """Official stop only. Caption ``→`` is not a stop (TV continuation)."""
+    del src_name
+    return ["\nJapanese:", "\nTranslate this", "\n\n"]
 
 
 def completion_max_tokens(
@@ -185,12 +182,17 @@ def count_prompt_tokens(llama: object, prompt: str) -> int:
 
 
 def take_arrow_right(text: str) -> str:
-    """If the completion contains →, keep the right side only."""
-    out = text
-    for marker in ARROW_MARKERS:
-        if marker in out:
-            out = out.rsplit(marker, 1)[-1]
-    return out.strip()
+    """Legacy prompt-leak helper. Caption arrows are stripped, not split."""
+    return strip_caption_arrows(text)
+
+
+def strip_caption_arrows(text: str) -> str:
+    """Leading and trailing TV-caption arrows only. Mid-line arrows stay."""
+    arrows = "|".join(re.escape(marker) for marker in CAPTION_ARROWS)
+    out = text.strip()
+    out = re.sub(rf"^(?:{arrows})+", "", out).strip()
+    out = re.sub(rf"(?:{arrows})+$", "", out).strip()
+    return out
 
 
 def strip_lang_prefixes(text: str, *names: str) -> str:
@@ -218,7 +220,7 @@ def strip_gemmax_completion(
     header = f"{tgt_name}:"
     if header in text:
         text = text.rsplit(header, 1)[-1]
-    text = take_arrow_right(text.strip())
+    text = strip_caption_arrows(text.strip())
     text = strip_lang_prefixes(text, tgt_name, src_name or "", "Spanish", "Japanese")
     if not text:
         return ""

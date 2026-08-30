@@ -11,13 +11,14 @@ from sublocal.backend import (
     NllbBackend,
     TranslatorBackend,
     leftover_arrow_count,
+    strip_caption_arrows,
 )
 from sublocal.cues_jsonl import cues_jsonl_path, langs_from_sidecar, write_cues_jsonl
 from sublocal.detect import DetectionError, detect_iso639
 from sublocal.extract import extract_file_glossary, merge_mappings, pykakasi_version
 from sublocal.formats import load, save
 from sublocal.formats.base import Cue, Document
-from sublocal.glossary import Glossary, as_glossary, is_names_only_output
+from sublocal.glossary import Glossary, as_glossary, is_majority_jp
 from sublocal.languages import display_code, to_flores
 from sublocal.lid import (
     detect_cue_lang,
@@ -101,8 +102,8 @@ def translate_document(
     """Translate cue text in-place. Returns (doc, src_flores, tgt_flores).
 
     Each cue is encoded with that cue's source language. Cues already in
-    ``to_code`` are copied through. GiNZA Person surfaces are Hepburn-replaced
-    in a *copy* of the Japanese (not ``xxNxx``). The SRT string is immutable.
+    ``to_code`` are copied through. One official completion per cue after
+    peel + caption-arrow strip + CJK Person Hepburn. No retry happy path.
     """
     cues = doc.cues
     if not cues:
@@ -123,11 +124,12 @@ def translate_document(
     merged = merge_mappings(file_map, yaml_map)
     person_keys = set(file_persons) | yaml_persons
     gloss = Glossary(merged, person_keys=person_keys) if merged else None
-    person_latins = gloss.person_latins() if gloss is not None else set()
     status(f"GiNZA entities {ginza_count} (pykakasi {pykakasi_version()})")
 
     translated: list[str | None] = [None] * len(texts)
     groups: dict[str, list[int]] = {}
+    speaker_prefix: list[str | None] = [None] * len(texts)
+    left_jp: list[bool] = [False] * len(texts)
     hepburn_count = 0
 
     for i, text in enumerate(texts):
@@ -137,15 +139,16 @@ def translate_document(
             continue
         src = to_flores(src_iso)
         if gloss is not None:
-            tag = gloss.speaker_tag_if_no_sentence(text)
-            if tag is not None:
-                translated[i] = tag
+            prefix, body = gloss.prepare_mt_body(text)
+            speaker_prefix[i] = prefix
+            if not body.strip():
+                translated[i] = prefix or ""
                 continue
-            send = gloss.hepburn_in_source(text)
+            send = body
             if send != text:
                 hepburn_count += 1
         else:
-            send = text
+            send = strip_caption_arrows(text)
         groups.setdefault(src, []).append(i)
         texts[i] = send
 
@@ -156,19 +159,12 @@ def translate_document(
     if callable(prepare) and send_count:
         prepare()
 
-    retry_count = 0
-    retry_used_src_original = False
+    leave_jp = 0
 
     if not groups:
         finals = [t if t is not None else "" for t in translated]
         apply_translations(doc, finals)
-        _log_mt_stats(
-            backend,
-            finals,
-            elapsed=None,
-            retry_count=retry_count,
-            retry_used_src_original=retry_used_src_original,
-        )
+        _log_mt_stats(backend, finals, elapsed=None, leave_jp=leave_jp, left_jp=left_jp)
         src_display = to_flores(langs[0]) if langs else tgt
         return doc, src_display, tgt
 
@@ -191,30 +187,24 @@ def translate_document(
             original = src_original[i]
             if gloss is not None:
                 body = gloss.overlay_names(original, body)
-            if is_names_only_output(body, person_latins):
-                status(
-                    f"Cue {i + 1}: empty/names-only ES; retry src_original"
+            if not body.strip() or is_majority_jp(body):
+                status(f"Cue {i + 1}: empty or majority-JP; leave JP (no retry)")
+                leave_jp += 1
+                left_jp[i] = True
+                translated[i] = original
+                continue
+            if speaker_prefix[i]:
+                body = (
+                    speaker_prefix[i]
+                    if not body
+                    else f"{speaker_prefix[i]} {body}"
                 )
-                retry_count += 1
-                retry_used_src_original = True
-                retry = backend.translate([original], src, tgt)
-                retry_text = retry[0] if retry else ""
-                if gloss is not None:
-                    body = gloss.overlay_names(original, retry_text)
-                else:
-                    body = retry_text
-                if is_names_only_output(body, person_latins):
-                    body = original
             translated[i] = body
     elapsed = time.monotonic() - started
     finals = [t if t is not None else "" for t in translated]
     apply_translations(doc, finals)
     _log_mt_stats(
-        backend,
-        finals,
-        elapsed=elapsed,
-        retry_count=retry_count,
-        retry_used_src_original=retry_used_src_original,
+        backend, finals, elapsed=elapsed, leave_jp=leave_jp, left_jp=left_jp
     )
     first_src = to_flores(langs[0]) if langs else tgt
     return doc, first_src, tgt
@@ -225,8 +215,8 @@ def _log_mt_stats(
     texts: list[str],
     *,
     elapsed: float | None,
-    retry_count: int = 0,
-    retry_used_src_original: bool = False,
+    leave_jp: int = 0,
+    left_jp: list[bool] | None = None,
 ) -> None:
     counts = getattr(backend, "finish_reason_counts", None)
     stop = 0
@@ -235,12 +225,14 @@ def _log_mt_stats(
         stop = int(counts.get("stop", 0))
         length = int(counts.get("length", 0))
     status(f"finish_reason stop={stop} length={length}")
-    arrows = sum(leftover_arrow_count(text) for text in texts)
+    flags = left_jp or [False] * len(texts)
+    arrows = 0
+    for text, copied in zip(texts, flags, strict=False):
+        if copied:
+            continue
+        arrows += leftover_arrow_count(text)
     status(f"leftover arrows {arrows}")
-    status(
-        f"src_original retries {retry_count} "
-        f"used_src_original={'yes' if retry_used_src_original else 'no'}"
-    )
+    status(f"leave JP {leave_jp} (empty or majority-JP; no retry)")
     if elapsed is not None:
         status(f"MT pass {elapsed:.1f}s")
 

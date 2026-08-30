@@ -181,10 +181,17 @@ def _name_sized(span: str) -> bool:
 
 
 def _speaker_candidates(span: str) -> list[str]:
-    """Prefer inner （name）; otherwise a short 《name》 / 【name】 span."""
+    """Prefer inner （name）; otherwise a short 《name》 / 【name】 span.
+
+    Honorifics are not the name: ``野崎さん`` → ``野崎``.
+    """
     match = _SPEAKER_START_PAREN_RE.match(span.strip())
     if match:
         return [match.group(1).strip()]
+    key = clean_glossary_key(span)
+    stem = honorific_stem(key)
+    if stem and is_acceptable_name_key(stem):
+        return [stem]
     if _name_sized(span):
         return [span.strip()]
     return []
@@ -206,6 +213,9 @@ def extract_speakers(
     out: list[str] = []
     for span in found:
         key = clean_glossary_key(span)
+        stem = honorific_stem(key)
+        if stem:
+            key = stem
         if is_generic_noun(key):
             continue
         if not is_person_place_surface(key, confirmed_set):
@@ -238,6 +248,8 @@ def extract_ginza_labeled(
         raw = clean_glossary_key(str(ent.text))
         stem = honorific_stem(raw)
         key = stem if stem and is_acceptable_name_key(stem) else raw
+        if label in GINZA_PERSON_LABELS:
+            key = shorten_overlong_person(key)
         if is_acceptable_name_key(key):
             out.append((key, str(label)))
     return out
@@ -269,12 +281,23 @@ def _add_span(
     mapping[key] = romanize_hepburn(key)
 
 
+def has_cjk_script(key: str) -> bool:
+    return bool(_JP_SCRIPT.search(key))
+
+
+def shorten_overlong_person(key: str) -> str:
+    """``野崎守`` → ``野崎``. Do not pykakasi the whole blob (Nozakishu)."""
+    if _KANJI_NAME.fullmatch(key) and len(key) > 2:
+        return key[:2]
+    return key
+
+
 def is_in_source_person_key(key: str) -> bool:
-    """True for Person-like surfaces that may be Hepburn-replaced in a JP copy."""
+    """CJK Person surfaces only. Never latin ``file`` / ``Liu`` / ASCII."""
     if not key or key in NON_PERSON_KEYS or is_generic_noun(key):
         return False
-    if is_latin_token(key):
-        return True
+    if is_latin_token(key) or not has_cjk_script(key):
+        return False
     return bool(_KANJI_NAME.fullmatch(key))
 
 
@@ -332,8 +355,6 @@ def extract_file_glossary(
                 person_keys.add(span)
         for span in extract_latin(text):
             mapping.setdefault(span, span)
-            if is_in_source_person_key(span):
-                person_keys.add(span)
     return mapping, ginza_count, person_keys
 
 
