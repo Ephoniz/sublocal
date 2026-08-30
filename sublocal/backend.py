@@ -73,6 +73,14 @@ def nllb_model_spec(name: str | None = None) -> NllbModelSpec:
 _SKIP_TOKENS = {"</s>", "<s>", "<pad>", "<unk>"}
 
 
+def _set_src_lang(tokenizer: object, src_flores: str) -> None:
+    """Set NLLB source language immediately before encode (per cue / group)."""
+    tokenizer.src_lang = src_flores  # type: ignore[attr-defined]
+    setter = getattr(tokenizer, "set_src_lang_special_tokens", None)
+    if callable(setter):
+        setter(src_flores)
+
+
 class TranslatorBackend(Protocol):
     def translate(
         self, texts: list[str], src_flores: str, tgt_flores: str
@@ -262,7 +270,6 @@ class NllbBackend:
         translator = self._translator
         assert tokenizer is not None and translator is not None
 
-        tokenizer.src_lang = src_flores
         out: list[str] = [""] * len(texts)
         nonempty = [(i, t) for i, t in enumerate(texts) if t.strip()]
         if not nonempty:
@@ -276,6 +283,9 @@ class NllbBackend:
             chunk = nonempty[start : start + batch_size]
             sources: list[list[str]] = []
             for _, text in chunk:
+                # FLORES src on this cue, then encode. Never reuse another
+                # cue's src_lang. Mixed files call translate() once per src.
+                _set_src_lang(tokenizer, src_flores)
                 token_ids = tokenizer.encode(text, add_special_tokens=True)
                 sources.append(tokenizer.convert_ids_to_tokens(token_ids))
             results = translator.translate_batch(

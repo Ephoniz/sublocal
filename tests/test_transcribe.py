@@ -7,6 +7,7 @@ import pytest
 from sublocal.cli import main
 from sublocal.formats import load
 from sublocal.glossary import Glossary
+from sublocal.cues_jsonl import cues_jsonl_path, read_cues_jsonl
 from sublocal.transcribe import (
     MAX_CUE_DURATION_S,
     Segment,
@@ -17,9 +18,11 @@ from sublocal.transcribe import (
     decode_audio,
     default_output_path,
     format_srt_timestamp,
+    stamp_langs_sequential,
     transcript_to_document,
     transcribe_file,
     validate_model,
+    whisper_transcribe_kwargs,
     write_transcript_srt,
 )
 
@@ -201,8 +204,9 @@ def test_cli_transcribe_mocked_writes_srt(
 
     seen: dict[str, str | None] = {}
 
-    def fake_infer(model, path, language, progress_cb):
+    def fake_infer(model, path, language, progress_cb, **kwargs):
         seen["language"] = language
+        seen["kwargs"] = kwargs
         progress_cb(12.0, 45.0)
         progress_cb(45.0, 45.0)
         return _fake_30s_window()
@@ -223,6 +227,11 @@ def test_cli_transcribe_mocked_writes_srt(
     doc = load(out)
     assert len(doc.cues) >= 3
     assert out.is_file()
+    sidecar = cues_jsonl_path(out)
+    assert sidecar.is_file()
+    rows = read_cues_jsonl(sidecar)
+    assert len(rows) == len(doc.cues)
+    assert {k for row in rows for k in row} >= {"start", "end", "text", "lang"}
 
 
 def test_cli_transcribe_missing_file(tmp_path: Path, capsys) -> None:
@@ -370,7 +379,7 @@ def test_transcribe_passes_ndarray_not_path(tmp_path, monkeypatch) -> None:
 
     seen: dict = {}
 
-    def fake_infer(model, audio, language, progress_cb):
+    def fake_infer(model, audio, language, progress_cb, **kwargs):
         seen["audio"] = audio
         progress_cb(1.0, 1.0)
         return _fake_30s_window()
@@ -400,6 +409,11 @@ def test_whisper_infer_calls_transcribe_with_ndarray() -> None:
     assert seen["kwargs"]["vad_filter"] is True
     assert seen["kwargs"]["vad_parameters"]["min_silence_duration_ms"] == 500
     assert seen["kwargs"].get("vad") is True
+    assert seen["kwargs"]["task"] == "transcribe"
+    assert seen["kwargs"]["language"] == "ja"
+    assert seen["kwargs"].get("multilingual") is False
+    assert seen["kwargs"]["condition_on_previous_text"] is False
+    assert seen["kwargs"]["without_timestamps"] is False
 
 
 def test_seek_progress_throttles(monkeypatch, capsys) -> None:

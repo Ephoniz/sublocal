@@ -102,7 +102,7 @@ def test_batch_600_cues(tmp_path: Path) -> None:
 
     recorder = ChunkRecorder()
     out = tmp_path / "big.en.srt"
-    translate_file(src, to_code="en", from_code="en", output_path=out, backend=recorder)
+    translate_file(src, to_code="en", from_code="es", output_path=out, backend=recorder)
     dst = load(out)
     assert len(dst.cues) == 600
     assert [c.timing for c in dst.cues] == [c.timing for c in load(src).cues]
