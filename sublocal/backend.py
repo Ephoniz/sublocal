@@ -1,8 +1,9 @@
-"""Translation backends. Default is local NLLB-200 via CTranslate2."""
+"""Translation backends. Default is local NLLB-200 3.3B via CTranslate2."""
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Protocol
 
 from sublocal.cache import hf_cache_dir
@@ -18,11 +19,55 @@ from sublocal.runtime import reject_anaconda_on_windows
 # Match the CLI promise: no telemetry. Must be set before huggingface_hub import.
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 
-# CTranslate2 int8 conversion of Meta's distilled 600M NLLB-200.
-# Source weights: facebook/nllb-200-distilled-600M (CC-BY-NC-4.0).
-DEFAULT_MODEL_REPO = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
-# Tokenizer files from the official NLLB repo (small; no model weights).
-DEFAULT_TOKENIZER_REPO = "facebook/nllb-200-distilled-600M"
+# Default: CTranslate2 float16 conversion of Meta's NLLB-200 3.3B (CC-BY-NC-4.0).
+# 600M distilled is --model small only. Do not ship 600M as the default.
+DEFAULT_MODEL_REPO = "entai2965/nllb-200-3.3B-ctranslate2-float16"
+DEFAULT_TOKENIZER_REPO = "facebook/nllb-200-3.3B"
+SMALL_MODEL_REPO = "JustFrederik/nllb-200-distilled-600M-ct2-int8"
+SMALL_TOKENIZER_REPO = "facebook/nllb-200-distilled-600M"
+
+
+@dataclass(frozen=True)
+class NllbModelSpec:
+    name: str
+    repo_id: str
+    tokenizer_repo: str
+    size_hint: str
+    cuda_compute_type: str
+
+
+LARGE_SPEC = NllbModelSpec(
+    name="3.3b",
+    repo_id=DEFAULT_MODEL_REPO,
+    tokenizer_repo=DEFAULT_TOKENIZER_REPO,
+    size_hint="~6GB+",
+    cuda_compute_type="float16",
+)
+SMALL_SPEC = NllbModelSpec(
+    name="small",
+    repo_id=SMALL_MODEL_REPO,
+    tokenizer_repo=SMALL_TOKENIZER_REPO,
+    size_hint="CTranslate2 int8, ~600 MB",
+    cuda_compute_type="int8_float16",
+)
+
+_MODEL_ALIASES = {
+    "small": SMALL_SPEC,
+    "600m": SMALL_SPEC,
+    "3.3b": LARGE_SPEC,
+    "large": LARGE_SPEC,
+}
+
+
+def nllb_model_spec(name: str | None = None) -> NllbModelSpec:
+    """Resolve ``small`` / ``3.3b`` / ``large``. Default is 3.3B, not 600M."""
+    key = (name or "3.3b").strip().lower()
+    try:
+        return _MODEL_ALIASES[key]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown NLLB model {name!r}. Use small, 3.3b, or large."
+        ) from exc
 
 # Skip special tokens that CTranslate2 may leave on the hypothesis.
 _SKIP_TOKENS = {"</s>", "<s>", "<pad>", "<unk>"}
@@ -57,8 +102,36 @@ def _quiet_ct2_debug() -> None:
     ctranslate2.set_log_level(logging.INFO)
 
 
-def _compute_type(device: str) -> str:
-    return "int8_float16" if device == "cuda" else "int8"
+def _compute_type(device: str, spec: NllbModelSpec | None = None) -> str:
+    if device != "cuda":
+        return "int8"
+    return (spec or LARGE_SPEC).cuda_compute_type
+
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "out of memory" in msg
+        or "cuda oom" in msg
+        or "cublas_status_alloc_failed" in msg
+    )
+
+
+def _create_translator(model_dir: str, device: str, compute_type: str):
+    """Build CTranslate2 Translator. CUDA float16 OOM retries once as int8_float16."""
+    import ctranslate2
+
+    try:
+        return ctranslate2.Translator(
+            model_dir, device=device, compute_type=compute_type
+        )
+    except Exception as exc:
+        if device == "cuda" and compute_type == "float16" and _is_cuda_oom(exc):
+            status("CUDA out of memory; retrying with int8_float16")
+            return ctranslate2.Translator(
+                model_dir, device=device, compute_type="int8_float16"
+            )
+        raise
 
 
 def _local_entry_error() -> type[Exception]:
@@ -73,22 +146,22 @@ def _local_entry_error() -> type[Exception]:
 
 
 class NllbBackend:
-    """NLLB-200 distilled 600M, CTranslate2 int8, downloaded on first use."""
+    """NLLB-200 3.3B CT2 float16 by default; 600M via ``model='small'``."""
 
     def __init__(
         self,
         device: str = "auto",
         batch_size: int = 32,
         repo_id: str | None = None,
+        model: str | None = None,
     ) -> None:
         reject_anaconda_on_windows()
+        self.spec = nllb_model_spec(model)
         self.device = resolve_device(device)
         self.batch_size = max(1, batch_size)
-        self.repo_id = repo_id or os.environ.get(
-            "SUBLOCAL_MODEL_REPO", DEFAULT_MODEL_REPO
-        )
-        self.tokenizer_repo = os.environ.get(
-            "SUBLOCAL_TOKENIZER_REPO", DEFAULT_TOKENIZER_REPO
+        self.repo_id = repo_id or os.environ.get("SUBLOCAL_MODEL_REPO") or self.spec.repo_id
+        self.tokenizer_repo = (
+            os.environ.get("SUBLOCAL_TOKENIZER_REPO") or self.spec.tokenizer_repo
         )
         self._translator = None
         self._tokenizer = None
@@ -150,16 +223,19 @@ class NllbBackend:
         # Again immediately before Translator(); that call AV-crashes on
         # Windows Anaconda instead of raising.
         reject_anaconda_on_windows()
+        # Sequential only: never keep Whisper in VRAM beside NLLB.
+        from sublocal.transcribe import unload_whisper
+
+        unload_whisper()
         os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
         os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
         from transformers.utils import logging as hf_logging
-        import ctranslate2
 
         _quiet_ct2_debug()
         hf_logging.set_verbosity_error()
         cache = str(hf_cache_dir())
         model_dir, model_cached = self._snapshot(
-            self.repo_id, cache, size_hint="CTranslate2 int8, ~600 MB"
+            self.repo_id, cache, size_hint=self.spec.size_hint
         )
         tokenizer, tok_cached = self._load_tokenizer(cache)
 
@@ -169,10 +245,10 @@ class NllbBackend:
             status("Loading model")
 
         self._tokenizer = tokenizer
-        self._translator = ctranslate2.Translator(
+        self._translator = _create_translator(
             model_dir,
-            device=self.device,
-            compute_type=_compute_type(self.device),
+            self.device,
+            _compute_type(self.device, self.spec),
         )
         status(f"Model ready (device={self.device})")
 

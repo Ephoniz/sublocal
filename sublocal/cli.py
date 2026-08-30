@@ -9,6 +9,7 @@ from sublocal.detect import DetectionError
 from sublocal.formats import UnsupportedFormatError
 from sublocal.languages import UnknownLanguageError
 from sublocal.device import CudaUnavailableError, unhide_cuda_env
+from sublocal.glossary import GlossaryError
 from sublocal.pipeline import backend_from_name, translate_file
 from sublocal.runtime import UnsupportedPythonError
 from sublocal.transcribe import transcribe_file
@@ -57,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path (default: input.<to>.<ext>)",
     )
     tr.add_argument(
+        "--glossary",
+        default=None,
+        metavar="PATH",
+        help="YAML map of source names to keep (e.g. examples/drama.yml)",
+    )
+    tr.add_argument(
+        "--model",
+        default="3.3b",
+        choices=("small", "3.3b", "large"),
+        help="NLLB size: 3.3b (default) or small (600M). large aliases 3.3b.",
+    )
+    tr.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
@@ -93,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Whisper language code (e.g. ja). Detected if omitted.",
     )
     transcribe.add_argument(
+        "--glossary",
+        default=None,
+        metavar="PATH",
+        help="YAML names for Whisper prompt and JP canonical spelling",
+    )
+    transcribe.add_argument(
         "--model",
         default="large-v3",
         help="Whisper model size (default: large-v3). Larger models are rejected.",
@@ -115,13 +134,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _cmd_translate(args: argparse.Namespace) -> int:
     try:
-        backend = backend_from_name(args.backend, args.device, args.batch_size)
+        backend = backend_from_name(
+            args.backend, args.device, args.batch_size, model=args.model
+        )
         out = translate_file(
             args.input,
             to_code=args.to,
             from_code=args.from_lang,
             output_path=args.out,
             backend=backend,
+            glossary=args.glossary,
         )
     except (
         FileNotFoundError,
@@ -131,6 +153,7 @@ def _cmd_translate(args: argparse.Namespace) -> int:
         UnsupportedFormatError,
         UnsupportedPythonError,
         CudaUnavailableError,
+        GlossaryError,
         OSError,
         RuntimeError,
     ) as exc:
@@ -148,12 +171,14 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
             model_size=args.model,
             output_path=args.out,
             device=args.device,
+            glossary=args.glossary,
         )
     except (
         FileNotFoundError,
         ValueError,
         UnsupportedPythonError,
         CudaUnavailableError,
+        GlossaryError,
         OSError,
         RuntimeError,
     ) as exc:

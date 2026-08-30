@@ -16,6 +16,7 @@ from sublocal.cache import hf_cache_dir
 from sublocal.device import resolve_device
 from sublocal.formats import save
 from sublocal.formats.base import Block, Cue, Document
+from sublocal.glossary import Glossary, as_glossary
 from sublocal.progress import enable_download_progress, format_eta, status
 from sublocal.runtime import reject_anaconda_on_windows
 
@@ -26,6 +27,7 @@ DEFAULT_REPO = "Systran/faster-whisper-large-v3"
 MAX_CHARS = 32
 GAP_SPLIT_S = 0.5
 GAP_MERGE_S = 0.15
+MAX_CUE_DURATION_S = 4.0
 VAD_MIN_SILENCE_MS = 500
 VAD_MIN_SILENCE_S = 0.5
 WHISPER_SAMPLE_RATE = 16000
@@ -147,6 +149,15 @@ class Transcript:
             Segment(words=chunk)
             for seg in self.segments
             for chunk in _split_words_by_gap(seg.words, max_gap)
+        ]
+        return self
+
+    def split_by_duration(self, max_duration: float) -> Transcript:
+        """Cap each cue at ``max_duration`` seconds (word-derived)."""
+        self.segments = [
+            Segment(words=chunk)
+            for seg in self.segments
+            for chunk in _split_words_by_duration(seg.words, max_duration)
         ]
         return self
 
@@ -349,13 +360,14 @@ def format_srt_timestamp(seconds: float) -> str:
 
 
 def apply_regroup(result: Any) -> Transcript:
-    """Sentence-sized cues: punctuation, 0.5s gaps, tiny-gap merge, ~32-char wrap."""
+    """Sentence-sized cues: punctuation, 0.5s gaps, ~4s caps, ~32-char wrap."""
     used_newline = False
     obj: Any = result
     if not _has_chain_methods(obj):
         obj = Transcript.from_any(obj)
     used_newline = _apply_chain(obj)
     transcript = obj if isinstance(obj, Transcript) else Transcript.from_any(obj)
+    transcript.split_by_duration(MAX_CUE_DURATION_S)
     if not used_newline:
         transcript.pair_lines()
     transcript.enforce_two_lines()
@@ -381,8 +393,21 @@ def transcript_to_document(transcript: Transcript) -> Document:
     return Document(format="srt", blocks=blocks)
 
 
-def write_transcript_srt(transcript: Transcript, path: Path) -> int:
+def canonicalize_document(doc: Document, glossary: Glossary) -> None:
+    """Protect JP names then restore the Japanese keys (not Latin)."""
+    for cue in doc.cues:
+        guarded, pairs = glossary.protect(cue.text)
+        cue.text = glossary.restore(guarded, pairs, target="key")
+
+
+def write_transcript_srt(
+    transcript: Transcript,
+    path: Path,
+    glossary: Glossary | None = None,
+) -> int:
     doc = transcript_to_document(transcript)
+    if glossary is not None:
+        canonicalize_document(doc, glossary)
     path.parent.mkdir(parents=True, exist_ok=True)
     save(doc, path)
     return len(doc.cues)
@@ -461,6 +486,9 @@ def _whisper_infer(
     audio: Any,
     language: str | None,
     progress_cb: Callable[[float, float], None],
+    *,
+    initial_prompt: str | None = None,
+    condition_on_previous_text: bool | None = None,
 ) -> Any:
     """Run stable-ts/faster-whisper on an in-memory waveform.
 
@@ -481,6 +509,10 @@ def _whisper_infer(
     }
     if language:
         kwargs["language"] = language
+    if initial_prompt is not None:
+        kwargs["initial_prompt"] = initial_prompt
+    if condition_on_previous_text is not None:
+        kwargs["condition_on_previous_text"] = condition_on_previous_text
     transcribe = model.transcribe
     try:
         return transcribe(audio, **kwargs)
@@ -514,6 +546,7 @@ def transcribe_file(
     model_size: str = DEFAULT_MODEL,
     output_path: str | Path | None = None,
     device: str = "auto",
+    glossary: Glossary | str | Path | None = None,
 ) -> Path:
     inp = Path(input_path)
     if not inp.is_file():
@@ -521,16 +554,21 @@ def transcribe_file(
     model_size = validate_model(model_size)
     out = Path(output_path) if output_path else default_output_path(inp)
     resolved = resolve_device(device)
+    gloss = as_glossary(glossary)
     waveform = decode_audio(inp)
     model = load_whisper(model_size, resolved)
     progress = SeekProgress()
+    infer_kw: dict[str, Any] = {}
+    if gloss is not None:
+        infer_kw["initial_prompt"] = gloss.whisper_prompt()
+        infer_kw["condition_on_previous_text"] = False
     try:
-        raw = _whisper_infer(model, waveform, language, progress)
+        raw = _whisper_infer(model, waveform, language, progress, **infer_kw)
         progress.finish()
         transcript = apply_regroup(raw)
         if not any(seg.words for seg in transcript.segments):
             raise ValueError("No speech found in the input file.")
-        n = write_transcript_srt(transcript, out)
+        n = write_transcript_srt(transcript, out, glossary=gloss)
         status(f"Wrote {n} cues")
         return out
     finally:
@@ -663,6 +701,25 @@ def _split_words_by_gap(words: list[Word], max_gap: float) -> list[list[Word]]:
             current = [nxt]
         else:
             current.append(nxt)
+    chunks.append(current)
+    return chunks
+
+
+def _split_words_by_duration(
+    words: list[Word], max_duration: float
+) -> list[list[Word]]:
+    if not words:
+        return []
+    chunks: list[list[Word]] = []
+    current = [words[0]]
+    origin = words[0].start
+    for w in words[1:]:
+        if w.end - origin > max_duration:
+            chunks.append(current)
+            current = [w]
+            origin = w.start
+        else:
+            current.append(w)
     chunks.append(current)
     return chunks
 

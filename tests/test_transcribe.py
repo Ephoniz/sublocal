@@ -6,7 +6,9 @@ import pytest
 
 from sublocal.cli import main
 from sublocal.formats import load
+from sublocal.glossary import Glossary
 from sublocal.transcribe import (
+    MAX_CUE_DURATION_S,
     Segment,
     Transcript,
     Word,
@@ -20,6 +22,8 @@ from sublocal.transcribe import (
     validate_model,
     write_transcript_srt,
 )
+
+DRAMA = Path(__file__).resolve().parents[1] / "examples" / "drama.yml"
 
 
 def _ja_chars(text: str, start: float, step: float = 0.12) -> list[Word]:
@@ -87,6 +91,39 @@ def test_regroup_sentence_cues_not_30s_or_per_word() -> None:
     # No cue spans the fake 30s window.
     for start_s, end_s in timings:
         assert not (start_s == "00:00:00,000" and end_s == "00:00:30,000")
+
+
+def test_split_by_duration_caps_8s_segment() -> None:
+    words = [Word(word="あ", start=i * 0.1, end=(i + 1) * 0.1) for i in range(80)]
+    tr = Transcript([Segment(words=words)])
+    tr.split_by_duration(4.0)
+    assert len(tr.segments) >= 2
+    for seg in tr.segments:
+        assert seg.words[-1].end - seg.words[0].start <= 4.0 + 1e-9
+    span = tr.segments[-1].words[-1].end - tr.segments[0].words[0].start
+    assert span == pytest.approx(8.0)
+
+
+def test_apply_regroup_gap_0_5_still_splits_and_duration_caps() -> None:
+    # Two phrases with a 0.60s gap (must stay split) plus an 8s run.
+    words = [
+        Word(word="あ", start=0.00, end=0.20),
+        Word(word="い", start=0.20, end=0.40),
+        Word(word="う", start=1.00, end=1.20),
+        Word(word="え", start=1.20, end=1.40),
+    ]
+    words.extend(Word(word="ん", start=2.0 + i * 0.5, end=2.0 + i * 0.5 + 0.4) for i in range(16))
+    result = apply_regroup(Transcript([Segment(words=words)]))
+    texts = [s.cue_text() for s in result.segments if s.words]
+    assert any(t == "あい" or t.startswith("あい") for t in texts)
+    assert any("うえ" in t or t == "うえ" for t in texts)
+    # 0.60s gap must not remelt あい and うえ.
+    joined_early = [t for t in texts if "あい" in t and "うえ" in t]
+    assert joined_early == []
+    for seg in result.segments:
+        if not seg.words:
+            continue
+        assert seg.words[-1].end - seg.words[0].start <= MAX_CUE_DURATION_S + 1e-9
 
 
 def test_japanese_punctuation_and_gap_and_merge() -> None:
@@ -195,6 +232,40 @@ def test_cli_transcribe_missing_file(tmp_path: Path, capsys) -> None:
     assert captured.out == ""
     assert "error:" in captured.err
     assert "not found" in captured.err.lower() or "Nope" in captured.err or "nope" in captured.err
+
+
+def test_transcribe_glossary_prompt_and_jp_keys(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dummy = tmp_path / "movie.mp4"
+    dummy.write_bytes(b"fake-media")
+    monkeypatch.setattr("sublocal.device.cuda_device_count", lambda: 1)
+    monkeypatch.setattr("sublocal.device.cuda_device_name", lambda index=0: "Fake GPU")
+    monkeypatch.setattr("sublocal.transcribe.load_whisper", lambda *a, **k: object())
+    monkeypatch.setattr("sublocal.transcribe.decode_audio", lambda path: object())
+    seen: dict = {}
+
+    def fake_infer(model, audio, language, progress_cb, **kwargs):
+        seen["language"] = language
+        seen.update(kwargs)
+        progress_cb(1.0, 1.0)
+        return Transcript([Segment(words=_ja_chars("野崎のドラム。", 0.50))])
+
+    monkeypatch.setattr("sublocal.transcribe._whisper_infer", fake_infer)
+    out = transcribe_file(
+        dummy, language="ja", glossary=DRAMA, output_path=tmp_path / "out.srt"
+    )
+    g = Glossary.load(DRAMA)
+    assert seen["language"] == "ja"
+    assert seen["initial_prompt"] == g.whisper_prompt()
+    assert "ドラム" in seen["initial_prompt"]
+    assert seen["condition_on_previous_text"] is False
+    doc = load(out)
+    text = "".join(c.text for c in doc.cues)
+    assert "ドラム" in text
+    assert "野崎" in text
+    assert "Drum" not in text
+    assert "Nozaki" not in text
 
 
 def test_transcribe_rejects_to_flag() -> None:
