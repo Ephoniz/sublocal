@@ -6,7 +6,7 @@ import pytest
 
 from sublocal.backend import EchoBackend
 from sublocal.formats import load
-from sublocal.glossary import Glossary, GlossaryError
+from sublocal.glossary import Glossary, GlossaryError, needs_nllb
 from sublocal.pipeline import translate_file
 
 DRAMA = Path(__file__).resolve().parents[1] / "examples" / "drama.yml"
@@ -61,6 +61,29 @@ def test_missing_sentinel_fails() -> None:
         g.restore("tambor", pairs)
 
 
+def test_needs_nllb_false_for_speaker_tag_groan() -> None:
+    g = _drama()
+    protected, pairs = g.protect("（東条）ううっ あっ あっ…")
+    assert pairs
+    assert "xx0xx" in protected
+    assert needs_nllb(protected) is False
+
+
+def test_needs_nllb_true_for_real_dialogue() -> None:
+    g = _drama()
+    protected, _pairs = g.protect("おい ドラム 東条 まだ起きねえのか？")
+    assert needs_nllb(protected) is True
+    particles, _ = g.protect("野崎のドラムとバンコク")
+    assert needs_nllb(particles) is True
+
+
+def test_restore_accepts_spaced_and_cased_sentinels() -> None:
+    g = _drama()
+    _protected, pairs = g.protect("ドラム")
+    assert g.restore("xx 0 xx", pairs) == "Drum"
+    assert g.restore("XX0XX", pairs) == "Drum"
+
+
 def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
     src = tmp_path / "ja.srt"
     src.write_text(
@@ -98,3 +121,46 @@ def test_restore_to_japanese_keys() -> None:
     g = _drama()
     protected, pairs = g.protect("野崎のドラム")
     assert g.restore(protected, pairs, target="key") == "野崎のドラム"
+
+
+def test_groan_cue_skips_nllb_dialogue_still_sent(tmp_path: Path, capsys) -> None:
+    src = tmp_path / "vivant.srt"
+    src.write_text(
+        "5\n"
+        "00:00:07,000 --> 00:00:08,500\n"
+        "（東条）ううっ あっ あっ…\n"
+        "\n"
+        "6\n"
+        "00:00:10,000 --> 00:00:13,000\n"
+        "《おい ドラム 東条 まだ起きねえのか？》\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "vivant.es.srt"
+    seen: list[str] = []
+
+    class Recorder(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            seen.extend(texts)
+            return super().translate(texts, src_flores, tgt_flores)
+
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=Recorder(),
+        glossary=DRAMA,
+    )
+    err = capsys.readouterr().err
+    assert "Translating 1 cues" in err
+    assert seen
+    assert all("ううっ" not in t for t in seen)
+    assert all("（xx0xx）" not in t and "（xx0xx)" not in t for t in seen)
+    assert any("xx" in t for t in seen)
+    assert any("起き" in t or "おい" in t for t in seen)
+    doc = load(out)
+    assert "Tojo" in doc.cues[0].text
+    assert "ううっ" in doc.cues[0].text
+    assert "Drum" in doc.cues[1].text
+    assert "Tojo" in doc.cues[1].text
+    assert "起き" in doc.cues[1].text

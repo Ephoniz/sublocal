@@ -8,7 +8,7 @@ from sublocal.backend import EchoBackend, NllbBackend, TranslatorBackend
 from sublocal.detect import detect_iso639
 from sublocal.formats import dumps, load, save
 from sublocal.formats.base import Document
-from sublocal.glossary import Glossary, GlossaryError, as_glossary
+from sublocal.glossary import Glossary, GlossaryError, as_glossary, needs_nllb
 from sublocal.languages import display_code, to_flores
 from sublocal.progress import status
 
@@ -52,18 +52,31 @@ def translate_document(
     gloss = as_glossary(glossary)
     texts = [c.text for c in cues]
     protected_pairs: list[list[tuple[str, str]]] = [[] for _ in texts]
+    local_only = [False] * len(texts)
     if gloss is not None:
         protected: list[str] = []
         for i, text in enumerate(texts):
             guarded, pairs = gloss.protect(text)
             protected.append(guarded)
             protected_pairs[i] = pairs
+            if pairs and not needs_nllb(guarded):
+                local_only[i] = True
         texts = protected
+    send_idx = [i for i, skip in enumerate(local_only) if not skip]
+    to_send = [texts[i] for i in send_idx]
     prepare = getattr(backend, "prepare", None)
-    if callable(prepare):
+    if callable(prepare) and to_send:
         prepare()
-    status(f"Translating {len(texts)} cues ({src} → {tgt})")
-    translated = backend.translate(texts, src, tgt)
+    status(f"Translating {len(to_send)} cues ({src} → {tgt})")
+    translated = list(texts)
+    if to_send:
+        batch = backend.translate(to_send, src, tgt)
+        if len(batch) != len(to_send):
+            raise RuntimeError(
+                f"Translator returned {len(batch)} texts for {len(to_send)} cues."
+            )
+        for i, text in zip(send_idx, batch, strict=True):
+            translated[i] = text
     if gloss is not None:
         restored: list[str] = []
         for i, text in enumerate(translated):

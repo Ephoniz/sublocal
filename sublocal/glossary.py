@@ -11,8 +11,25 @@ match. A missing sentinel fails the cue; names are never silently dropped.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
+
+# Mutations NLLB sometimes emits around the opaque sentinel.
+_SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
+
+# Whitespace, speaker-tag brackets, quotes, ellipsis, and JP/ASCII punctuation.
+_SPLIT_RE = re.compile(
+    r"[\s"
+    r"（）()＜＞《》〈〉【】\[\]『』「」"
+    r"\"'“”‘’«»"
+    r"…⋯・。．.!?！？ー\-~,~～,，]"
+    r"+"
+)
+
+# うっ+/あっ+/えっ+/ああ+/ええ+/ん+/だっ+/ヒー+
+# ー is also a split char, so ヒー collapses to ヒ after tokenize.
+_GROAN_RE = re.compile(r"^(?:うっ+|あっ+|えっ+|ああ+|ええ+|ん+|だっ+|ヒー+|ヒ)$")
 
 
 class GlossaryError(RuntimeError):
@@ -21,6 +38,35 @@ class GlossaryError(RuntimeError):
 
 def _sentinel(n: int) -> str:
     return f"xx{n}xx"
+
+
+def canonicalize_sentinels(text: str, pair_count: int) -> str:
+    """Normalize ``xx 0 xx`` / ``XX0XX`` to ``xx{n}xx`` when ``n`` is in range."""
+
+    def _canon(match: re.Match[str]) -> str:
+        n = int(match.group(1))
+        if 0 <= n < pair_count:
+            return _sentinel(n)
+        return match.group(0)
+
+    return _SENTINEL_MUTATION_RE.sub(_canon, text)
+
+
+def needs_nllb(protected: str) -> bool:
+    """True if leftover tokens after stripping sentinels are real dialogue.
+
+    Groan-only remainders (うっ / あっ / …) are False so speaker-tag cries
+    are restored locally instead of being sent to NLLB, which drops ``xxNxx``.
+    Particles such as の / と still return True.
+    """
+    stripped = _SENTINEL_MUTATION_RE.sub("", protected)
+    for token in _SPLIT_RE.split(stripped):
+        if not token:
+            continue
+        if _GROAN_RE.fullmatch(token):
+            continue
+        return True
+    return False
 
 
 def load_mapping(path: str | Path) -> dict[str, str]:
@@ -95,7 +141,7 @@ class Glossary:
         target: Literal["value", "key"] = "value",
     ) -> str:
         """Put sentinels back. ``target='value'`` → Latin; ``'key'`` → JP."""
-        out = text
+        out = canonicalize_sentinels(text, len(pairs))
         for i, (key, value) in enumerate(pairs):
             token = _sentinel(i)
             if token not in out:
