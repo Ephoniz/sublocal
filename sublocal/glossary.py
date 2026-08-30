@@ -4,11 +4,11 @@ NLLB has no prompt, so proper names must be pulled out of the source string
 before translation. Injecting Latin (Drum, Nozaki) into Japanese is how
 ドラム became tambor — the model then "translates" the English word.
 
-Protect longest-first with spaced ``GLS{n}`` tokens and send the FULL cue
-so particles (に飛んだ) stay in the same sentence as the name. Restore
-``GLS{n}`` (also ``GLS n`` / ``gls0`` / ``<g{n}>``) to Latin. Never
-fragment-split: that left おい/に/が untranslated and turned に飛んだ
-into “the moon”.
+GPU path: send the original Japanese sentence (バンコク stays inside
+バンコクに飛んだ). After MT, ``overlay_names`` writes Latin over surviving
+JP keys, known aliases (tambor→Drum, Nagasaki→Nozaki), and moon/luna
+when バンコク was in the source. ``protect`` / ``GLS{n}`` stay for
+unit tests and the no-kanji local skip — they are not sent to NLLB.
 """
 
 from __future__ import annotations
@@ -25,6 +25,11 @@ _SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
 _WRAPPERS = "《》＜＞「」『』"
 _PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい", "よう")
 _BRACKETS = "《》＜＞「」"
+_ALIASES = (
+    ("tambor", "Drum"),
+    ("nagasaki", "Nozaki"),
+)
+_MOON_RE = re.compile(r"\bthe moon\b|\bla luna\b", re.IGNORECASE)
 
 
 class GlossaryError(RuntimeError):
@@ -173,6 +178,35 @@ class Glossary:
                 )
             replacement = key if target == "key" else value
             out = out.replace(token, replacement)
+        return out
+
+    def overlay_names(self, source: str, mt: str) -> str:
+        """Write Latin names onto an MT string. Never used as an NLLB input.
+
+        Surviving JP keys → Latin (longest-first). Known aliases
+        (tambor→Drum, Nagasaki→Nozaki). If バンコク was in ``source`` and
+        Bangkok is missing, ``the moon`` / ``la luna`` become Bangkok.
+        Any required Latin still missing is prepended.
+        """
+        required: list[str] = []
+        out = mt
+        for key, value in self.entries:
+            if key not in source:
+                continue
+            required.append(value)
+            if key in out:
+                out = out.replace(key, value)
+        required_set = set(required)
+        for alias, latin in _ALIASES:
+            if latin not in required_set:
+                continue
+            out = re.sub(re.escape(alias), latin, out, flags=re.IGNORECASE)
+        if "Bangkok" in required_set and "Bangkok" not in out:
+            out = _MOON_RE.sub("Bangkok", out)
+        missing = [value for value in required if value not in out]
+        if missing:
+            prefix = " ".join(missing)
+            out = f"{prefix} {out}".strip() if out.strip() else prefix
         return out
 
     def cleanup_adjacent(self, text: str, latin_values: list[str]) -> str:

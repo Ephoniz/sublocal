@@ -36,7 +36,7 @@ Default model is **NLLB-200 3.3B** through CTranslate2 on CUDA with float16. `--
 
 `--from` is optional; source language is detected from cue text when omitted.
 
-`--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). NLLB has no prompt, so each JP key is replaced with an opaque ASCII sentinel before translation and restored afterward. Do not put Latin names (Drum, Nozaki) into the Japanese string — that is how ドラム became tambor.
+`--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). The original Japanese sentence is sent to NLLB (バンコク stays inside バンコクに飛んだ). After MT, Latin names are overlaid and leftover particles next to those names are stripped. Do not inject Latin (Drum, Nozaki) or GLS / `<gN>` placeholders into the Japanese string — that is how ドラム became tambor and how cue 37 dropped both sentinels.
 
 First-run 3.3B download is large (~6GB+) into the same Hugging Face cache as below. No Hugging Face token required.
 

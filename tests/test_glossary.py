@@ -108,9 +108,10 @@ def test_echo_full_cue_strips_particles(tmp_path: Path) -> None:
     assert seen
     assert all("Drum" not in t for t in seen)
     assert all("Bangkok" not in t for t in seen)
-    assert all("バンコク" not in t for t in seen)
+    assert all("GLS" not in t for t in seen)
+    assert all("<g" not in t for t in seen)
+    assert any("バンコク" in t for t in seen)
     assert any("に飛んだ" in t for t in seen)
-    assert any("GLS" in t for t in seen)
     doc = load(out)
     text = doc.cues[0].text
     assert "Nozaki" in text
@@ -161,9 +162,10 @@ def test_bracketed_speaker_plus_kanji_body(tmp_path: Path) -> None:
         glossary=DRAMA,
     )
     assert seen
-    assert all("野崎" not in t for t in seen)
     assert all("東条" not in t for t in seen)
+    assert all("GLS" not in t for t in seen)
     assert any("フライト" in t or "変更" in t for t in seen)
+    assert any("野崎" in t for t in seen)
     assert any("に飛んだ" in t for t in seen)
     doc = load(out)
     assert doc.cues[0].text.startswith("(Nozaki)")
@@ -209,6 +211,8 @@ def test_yoh_vocative_restores_locally(tmp_path: Path) -> None:
     assert seen
     assert all("よう" not in t for t in seen)
     assert all("東条" not in t for t in seen)
+    assert all("GLS" not in t for t in seen)
+    assert any("バンコク" in t for t in seen)
     assert any("に飛んだ" in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
@@ -247,7 +251,8 @@ def test_groan_not_sent_output_has_tojo(tmp_path: Path) -> None:
     )
     assert seen
     assert all("ううっ" not in t for t in seen)
-    assert all("東条" not in t for t in seen)
+    assert all("GLS" not in t for t in seen)
+    assert any("ドラム" in t for t in seen)
     assert any("起き" in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
@@ -256,58 +261,94 @@ def test_groan_not_sent_output_has_tojo(tmp_path: Path) -> None:
     assert "Tojo" in doc.cues[1].text
 
 
-def test_xml_retry_when_gls_dropped(tmp_path: Path) -> None:
-    src = tmp_path / "retry.srt"
+def test_cue37_sends_original_jp(tmp_path: Path) -> None:
+    src = tmp_path / "c37.srt"
     src.write_text(
-        "1\n00:00:00,000 --> 00:00:02,000\nバンコクに飛んだ\n",
+        "37\n"
+        "00:00:48,000 --> 00:00:52,000\n"
+        "《おい ドラム 東条 まだ起きねえのか？》\n",
         encoding="utf-8",
     )
-    out = tmp_path / "retry.es.srt"
-    calls: list[list[str]] = []
+    out = tmp_path / "c37.es.srt"
+    seen: list[str] = []
 
-    class DropThenXml(EchoBackend):
+    class Recorder(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
-            calls.append(list(texts))
-            if any("<g" in t for t in texts):
-                return list(texts)
-            return ["he flew to the moon" for _ in texts]
+            seen.extend(texts)
+            return super().translate(texts, src_flores, tgt_flores)
 
     translate_file(
         src,
         to_code="es",
         from_code="ja",
         output_path=out,
-        backend=DropThenXml(),
+        backend=Recorder(),
         glossary=DRAMA,
     )
-    assert len(calls) == 2
-    assert any("GLS" in t for t in calls[0])
-    assert any("<g0>" in t or "<g" in t for t in calls[1])
+    assert seen
+    assert any("ドラム" in t and "東条" in t and "起きねえ" in t for t in seen)
+    assert all("GLS" not in t for t in seen)
+    assert all("<g" not in t for t in seen)
+    assert all("Drum" not in t for t in seen)
     doc = load(out)
-    assert "Bangkok" in doc.cues[0].text
-    assert "バンコク" not in doc.cues[0].text
+    assert "Drum" in doc.cues[0].text
+    assert "Tojo" in doc.cues[0].text
+    assert "ドラム" not in doc.cues[0].text
+    assert "東条" not in doc.cues[0].text
+    assert "おい" not in doc.cues[0].text
 
 
-def test_missing_after_xml_retry_fails(tmp_path: Path) -> None:
-    src = tmp_path / "drop.srt"
+def test_overlay_names_moon_and_tambor() -> None:
+    g = _drama()
+    moon = g.overlay_names("バンコクに飛んだ", "flew to the moon")
+    assert "Bangkok" in moon
+    assert "moon" not in moon.lower()
+    drum = g.overlay_names("ドラム", "tambor")
+    assert "Drum" in drum
+    assert "tambor" not in drum.lower()
+
+
+def test_overlay_nagasaki_and_prepend() -> None:
+    g = _drama()
+    nozaki = g.overlay_names("野崎", "went to Nagasaki")
+    assert "Nozaki" in nozaki
+    assert "Nagasaki" not in nozaki
+    missing = g.overlay_names("ドラム 東条", "hey still sleeping?")
+    assert missing.startswith("Drum Tojo") or (
+        "Drum" in missing and "Tojo" in missing
+    )
+
+
+def test_pipeline_overlay_moon_not_fail_loud(tmp_path: Path) -> None:
+    src = tmp_path / "moon.srt"
     src.write_text(
         "1\n00:00:00,000 --> 00:00:02,000\nバンコクに飛んだ\n",
         encoding="utf-8",
     )
+    out = tmp_path / "moon.es.srt"
+    seen: list[str] = []
 
-    class AlwaysDrop(EchoBackend):
+    class MoonBackend(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
-            return ["the moon" for _ in texts]
+            seen.extend(texts)
+            return ["flew to the moon" for _ in texts]
 
-    with pytest.raises(GlossaryError, match="GLS0"):
-        translate_file(
-            src,
-            to_code="es",
-            from_code="ja",
-            output_path=tmp_path / "drop.es.srt",
-            backend=AlwaysDrop(),
-            glossary=DRAMA,
-        )
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=MoonBackend(),
+        glossary=DRAMA,
+    )
+    assert seen
+    assert any("バンコクに飛んだ" in t for t in seen)
+    assert all("GLS" not in t for t in seen)
+    assert all("<g" not in t for t in seen)
+    doc = load(out)
+    assert "Bangkok" in doc.cues[0].text
+    assert "moon" not in doc.cues[0].text.lower()
+    assert "バンコク" not in doc.cues[0].text
 
 
 def test_restore_to_japanese_keys() -> None:

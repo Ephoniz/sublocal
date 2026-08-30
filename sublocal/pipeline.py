@@ -10,7 +10,6 @@ from sublocal.formats import dumps, load, save
 from sublocal.formats.base import Document
 from sublocal.glossary import (
     Glossary,
-    GlossaryError,
     as_glossary,
     has_cjk,
     needs_nllb,
@@ -69,7 +68,7 @@ def translate_document(
     translated = [""] * len(texts)
     send_idx: list[int] = []
     to_send: list[str] = []
-    guarded_by_i: list[str] = [""] * len(texts)
+    source_by_i: list[str] = [""] * len(texts)
     pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
     speaker_prefix: list[str | None] = [None] * len(texts)
 
@@ -81,8 +80,8 @@ def translate_document(
                 translated[i] = speaker_prefix[i] or ""
                 continue
             text = rest
+        source_by_i[i] = text
         guarded, pairs = gloss.protect(text)
-        guarded_by_i[i] = guarded
         pairs_by_i[i] = pairs
         if pairs and not needs_nllb(guarded):
             restored = gloss.restore(guarded, pairs, target="value")
@@ -90,7 +89,7 @@ def translate_document(
             translated[i] = _with_speaker(speaker_prefix[i], body)
             continue
         send_idx.append(i)
-        to_send.append(guarded)
+        to_send.append(text)
 
     if callable(prepare) and to_send:
         prepare()
@@ -104,22 +103,12 @@ def translate_document(
             )
 
     for j, i in enumerate(send_idx):
-        pairs = pairs_by_i[i]
+        source = source_by_i[i]
         mt = batch[j]
-        if not pairs:
-            translated[i] = _with_speaker(speaker_prefix[i], mt)
-            continue
-        try:
-            if gloss.missing_sentinels(mt, pairs):
-                xml = gloss.to_xml(guarded_by_i[i], len(pairs))
-                retried = backend.translate([xml], src, tgt)
-                if len(retried) != 1:
-                    raise RuntimeError("XML glossary retry returned the wrong count.")
-                mt = retried[0]
-            restored = gloss.restore(mt, pairs, target="value")
-        except GlossaryError as exc:
-            raise GlossaryError(f"Cue {i + 1}: {exc}") from exc
-        body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
+        body = gloss.overlay_names(source, mt)
+        latins = [v for k, v in gloss.entries if k in source]
+        if latins:
+            body = gloss.cleanup_adjacent(body, latins)
         translated[i] = _with_speaker(speaker_prefix[i], body)
     apply_translations(doc, translated)
     return doc, src, tgt
