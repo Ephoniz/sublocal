@@ -28,6 +28,11 @@ _SPEAKER_LENTICULAR_RE = re.compile(r"【([^】]+)】")
 _SPEAKER_START_PAREN_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]")
 
 _JP_SCRIPT = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u9fff\uf900-\ufaff]")
+# Clause particles that mean the span is not a bare name (野崎は / 野崎をマネて).
+_NAME_PARTICLES = ("は", "が", "を", "に", "で")
+_HONORIFICS = ("さん", "くん", "ちゃん", "様")
+_TRAILING_JUNK = "）)」。.、， "
+MAX_NAME_KEY_CHARS = 12
 
 
 def is_latin_token(text: str) -> bool:
@@ -82,14 +87,34 @@ def romanize_hepburn(text: str) -> str:
     return roman[0].upper() + roman[1:]
 
 
-def _name_sized(span: str) -> bool:
-    """Reject full-line 《dialogue》 wraps; keep 《野崎》 / 【佐野】."""
-    stripped = span.strip()
-    if not stripped or len(stripped) > 16:
+def clean_glossary_key(span: str) -> str:
+    """Strip wrapping junk (trailing ``）`` / ``。``) so ``佐野）`` → ``佐野``."""
+    return span.strip().strip(_TRAILING_JUNK)
+
+
+def is_acceptable_name_key(key: str) -> bool:
+    """Keep Person/Place surfaces. Drop clause-length and particle-glued junk."""
+    if not key:
         return False
-    if any(mark in stripped for mark in ("。", "？", "?", "！", "!")):
+    if is_latin_token(key):
+        return True
+    if "公安" in key:
+        return False
+    if any(particle in key for particle in _NAME_PARTICLES):
+        return False
+    if any(key.endswith(suffix) for suffix in _HONORIFICS):
+        return False
+    if len(key) > MAX_NAME_KEY_CHARS:
+        return False
+    if any(mark in key for mark in ("。", "？", "?", "！", "!", "→")):
         return False
     return True
+
+
+def _name_sized(span: str) -> bool:
+    """Reject full-line 《dialogue》 wraps; keep 《野崎》 / 【佐野】."""
+    key = clean_glossary_key(span)
+    return is_acceptable_name_key(key)
 
 
 def _speaker_candidates(span: str) -> list[str]:
@@ -112,7 +137,8 @@ def extract_speakers(text: str) -> list[str]:
     match = _SPEAKER_START_PAREN_RE.match(text)
     if match:
         found.append(match.group(1).strip())
-    return [span for span in found if span]
+    cleaned = [clean_glossary_key(span) for span in found]
+    return [span for span in cleaned if is_acceptable_name_key(span)]
 
 
 def extract_latin(text: str) -> list[str]:
@@ -124,18 +150,19 @@ def extract_ginza_ents(text: str, nlp: object | None) -> list[str]:
         return []
     doc = nlp(text)  # type: ignore[operator]
     ents = getattr(doc, "ents", ())
-    return [
-        str(ent.text).strip()
-        for ent in ents
-        if getattr(ent, "label_", None) in GINZA_LABELS and str(ent.text).strip()
-    ]
+    out: list[str] = []
+    for ent in ents:
+        if getattr(ent, "label_", None) not in GINZA_LABELS:
+            continue
+        key = clean_glossary_key(str(ent.text))
+        if is_acceptable_name_key(key):
+            out.append(key)
+    return out
 
 
 def _add_span(mapping: dict[str, str], span: str) -> None:
-    key = span.strip()
-    if not key:
-        return
-    if key in mapping:
+    key = clean_glossary_key(span)
+    if not is_acceptable_name_key(key) or key in mapping:
         return
     if is_latin_token(key):
         mapping[key] = key

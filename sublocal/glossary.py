@@ -6,7 +6,8 @@ Names are pulled out of the source string before MT. Injecting Latin
 
 Algorithm: longest-first replace of source keys with opaque ASCII sentinels
 ``xx{n}xx``, send the protected cue through the official GemmaX2 prompt,
-restore by exact match. A missing sentinel fails the cue.
+restore by exact match. A missing sentinel fails that cue only
+(retry padded/XML, then overlay leftover JP keys) — never the document.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from typing import Literal
 
 # Mutations a model sometimes emits around the opaque sentinel.
 _SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
+_EXACT_SENTINEL_RE = re.compile(r"xx(\d+)xx", re.IGNORECASE)
+_XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
 _WRAPPERS = "《》＜＞「」『』"
@@ -38,7 +41,7 @@ def _sentinel(n: int) -> str:
 
 
 def canonicalize_sentinels(text: str, pair_count: int) -> str:
-    """Normalize ``xx 0 xx`` / ``XX0XX`` to ``xx{n}xx`` when ``n`` is in range."""
+    """Normalize ``xx 0 xx`` / ``XX0XX`` / ``<g0>`` to ``xx{n}xx``."""
 
     def _canon(match: re.Match[str]) -> str:
         n = int(match.group(1))
@@ -46,7 +49,8 @@ def canonicalize_sentinels(text: str, pair_count: int) -> str:
             return _sentinel(n)
         return match.group(0)
 
-    return _SENTINEL_MUTATION_RE.sub(_canon, text)
+    out = _XML_RE.sub(_canon, text)
+    return _SENTINEL_MUTATION_RE.sub(_canon, out)
 
 
 def _strip_sentinels(text: str) -> str:
@@ -139,9 +143,47 @@ class Glossary:
                 start = idx + len(token)
         return out, pairs
 
+    def pad_sentinels(self, protected: str) -> str:
+        """``いいかxx0xx`` → ``いいか xx0xx `` so a glued name is less likely dropped."""
+
+        def _pad(match: re.Match[str]) -> str:
+            start, end = match.span()
+            token = _sentinel(int(match.group(1)))
+            left = "" if start == 0 or protected[start - 1].isspace() else " "
+            right = "" if end == len(protected) or protected[end].isspace() else " "
+            return f"{left}{token}{right}"
+
+        return _EXACT_SENTINEL_RE.sub(_pad, protected)
+
+    def to_xml(self, protected: str, pair_count: int) -> str:
+        """Retry form: ``xx{n}xx`` → ``<g{n}>``."""
+        canon = canonicalize_sentinels(protected, pair_count)
+        for i in range(pair_count):
+            canon = canon.replace(_sentinel(i), f"<g{i}>")
+        return canon
+
     def missing_sentinels(self, text: str, pairs: list[tuple[str, str]]) -> list[int]:
         canon = canonicalize_sentinels(text, len(pairs))
         return [i for i in range(len(pairs)) if _sentinel(i) not in canon]
+
+    def restore_surviving(
+        self,
+        text: str,
+        pairs: list[tuple[str, str]],
+        *,
+        target: Literal["value", "key"] = "value",
+    ) -> tuple[str, list[int]]:
+        """Restore sentinels that are present. Return ``(text, missing_indices)``."""
+        out = canonicalize_sentinels(text, len(pairs))
+        missing: list[int] = []
+        for i, (key, value) in enumerate(pairs):
+            token = _sentinel(i)
+            if token not in out:
+                missing.append(i)
+                continue
+            replacement = key if target == "key" else value
+            out = out.replace(token, replacement)
+        return out, missing
 
     def restore(
         self,

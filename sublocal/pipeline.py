@@ -133,6 +133,7 @@ def translate_document(
     # src_flores → list of cue indices to send
     groups: dict[str, list[int]] = {}
     pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
+    source_by_i: list[str] = [""] * len(texts)
     latin_by_i: list[list[str]] = [[] for _ in texts]
     speaker_prefix: list[str | None] = [None] * len(texts)
     protect_count = 0
@@ -160,6 +161,7 @@ def translate_document(
                 translated[i] = _with_speaker(speaker_prefix[i], body)
                 continue
             pairs_by_i[i] = pairs
+            source_by_i[i] = work
             send = guarded
         else:
             send = work
@@ -204,7 +206,15 @@ def translate_document(
             body = mt
             if gloss is not None and pairs_by_i[i]:
                 body = _restore_or_retry(
-                    gloss, mt, pairs_by_i[i], backend, texts[i], src, tgt, cue_index=i
+                    gloss,
+                    mt,
+                    pairs_by_i[i],
+                    backend,
+                    texts[i],
+                    src,
+                    tgt,
+                    source=source_by_i[i],
+                    cue_index=i,
                 )
                 latins = [v for _, v in pairs_by_i[i]]
                 if latins:
@@ -227,21 +237,25 @@ def _restore_or_retry(
     src: str,
     tgt: str,
     *,
+    source: str,
     cue_index: int,
 ) -> str:
-    """Restore xxNxx. Retry the cue once, then fail loud."""
+    """Restore xxNxx. One padded/XML retry, then overlay that cue — never abort."""
     try:
         return gloss.restore(mt, pairs, target="value")
-    except GlossaryError:
-        retry = backend.translate([send], src, tgt)
-        if not retry:
-            raise GlossaryError(
-                f"Cue {cue_index + 1}: glossary sentinel missing after translation"
-            ) from None
+    except GlossaryError as exc:
+        status(f"Cue {cue_index + 1}: {exc}; retrying padded/xml")
+        retry_send = gloss.pad_sentinels(send)
+        if retry_send == send:
+            retry_send = gloss.to_xml(send, len(pairs))
+        retry = backend.translate([retry_send], src, tgt)
+        retry_text = retry[0] if retry else mt
         try:
-            return gloss.restore(retry[0], pairs, target="value")
-        except GlossaryError as exc:
-            raise GlossaryError(f"Cue {cue_index + 1}: {exc}") from exc
+            return gloss.restore(retry_text, pairs, target="value")
+        except GlossaryError as exc2:
+            status(f"Cue {cue_index + 1}: {exc2}; overlay leftover names")
+            body, _missing = gloss.restore_surviving(retry_text, pairs, target="value")
+            return gloss.overlay_names(source or send, body)
 
 
 def _log_mt_stats(
@@ -251,11 +265,12 @@ def _log_mt_stats(
     elapsed: float | None,
 ) -> None:
     counts = getattr(backend, "finish_reason_counts", None)
-    if counts:
-        status(
-            f"finish_reason stop={counts.get('stop', 0)} "
-            f"length={counts.get('length', 0)}"
-        )
+    stop = 0
+    length = 0
+    if counts is not None:
+        stop = int(counts.get("stop", 0))
+        length = int(counts.get("length", 0))
+    status(f"finish_reason stop={stop} length={length}")
     arrows = sum(leftover_arrow_count(text) for text in texts)
     status(f"leftover arrows {arrows}")
     if elapsed is not None:

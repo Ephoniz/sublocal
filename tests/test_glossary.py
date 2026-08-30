@@ -73,6 +73,7 @@ def test_restore_accepts_spaced_and_cased_gls() -> None:
     _protected, pairs = g.protect("ドラム")
     assert g.restore("xx 0 xx", pairs) == "Drum"
     assert g.restore("XX0XX", pairs) == "Drum"
+    assert g.restore("<g0>", pairs) == "Drum"
 
 
 def test_missing_sentinel_fails() -> None:
@@ -317,7 +318,7 @@ def test_overlay_nagasaki_and_prepend() -> None:
     )
 
 
-def test_pipeline_missing_sentinel_fails(tmp_path: Path) -> None:
+def test_pipeline_missing_sentinel_overlays_and_writes(tmp_path: Path) -> None:
     src = tmp_path / "moon.srt"
     src.write_text(
         "1\n00:00:00,000 --> 00:00:02,000\nバンコクに飛んだ\n",
@@ -329,15 +330,18 @@ def test_pipeline_missing_sentinel_fails(tmp_path: Path) -> None:
         def translate(self, texts, src_flores, tgt_flores):
             return ["flew to the moon" for _ in texts]
 
-    with pytest.raises(GlossaryError, match="xx0xx"):
-        translate_file(
-            src,
-            to_code="es",
-            from_code="ja",
-            output_path=out,
-            backend=MoonBackend(),
-            glossary=DRAMA,
-        )
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=MoonBackend(),
+        glossary=DRAMA,
+    )
+    assert out.is_file()
+    doc = load(out)
+    assert "Bangkok" in doc.cues[0].text
+    assert "バンコク" not in doc.cues[0].text
 
 
 def test_restore_to_japanese_keys() -> None:

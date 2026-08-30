@@ -9,6 +9,7 @@ import pytest
 from sublocal.backend import (
     DEFAULT_MAX_TOKENS,
     LENGTH_RETRY_MAX_TOKENS,
+    EchoBackend,
     GemmaXBackend,
     completion_max_tokens,
     gemmax_prompt,
@@ -23,6 +24,7 @@ from sublocal.extract import (
     extract_file_glossary,
     extract_ginza_ents,
     extract_speakers,
+    is_acceptable_name_key,
     merge_mappings,
     pykakasi_version,
     romanize_hepburn,
@@ -375,3 +377,87 @@ def test_hepburn_capitalize_nozaki() -> None:
     assert romanize_hepburn("野崎") == "Nozaki"
     assert romanize_hepburn("佐野") == "Sano"
     assert romanize_hepburn("Liu") == "Liu"
+
+
+def test_junk_clause_keys_not_in_extracted_map() -> None:
+    class Ent:
+        def __init__(self, text: str, label_: str) -> None:
+            self.text = text
+            self.label_ = label_
+
+    class Nlp:
+        def __call__(self, text: str):
+            return type(
+                "Doc",
+                (),
+                {
+                    "ents": [
+                        Ent("野崎", "Person"),
+                        Ent("野崎が大きく息を吐く", "Person"),
+                        Ent("野崎さん", "Person"),
+                        Ent("野崎をマネて", "Person"),
+                        Ent("佐野）", "Person"),
+                        Ent("佐野公安部", "Person"),
+                        Ent("公安", "Government"),
+                    ]
+                },
+            )()
+
+    texts = [
+        "（佐野）5年前 野崎は北京で→",
+        "野崎が大きく息を吐く",
+        "野崎さん",
+    ]
+    mapping, _count = extract_file_glossary(texts, ["ja", "ja", "ja"], nlp=Nlp(), load=False)
+    assert "野崎" in mapping
+    assert "佐野" in mapping
+    assert "野崎が大きく息を吐く" not in mapping
+    assert "野崎さん" not in mapping
+    assert "野崎をマネて" not in mapping
+    assert "佐野公安部" not in mapping
+    assert "佐野）" not in mapping
+    assert "公安" not in mapping
+    assert not is_acceptable_name_key("野崎が大きく息を吐く")
+    assert is_acceptable_name_key("野崎")
+
+
+def test_missing_sentinel_fails_cue_not_document(tmp_path: Path, capsys) -> None:
+    src = _srt(
+        tmp_path,
+        "ep16.srt",
+        [
+            ("00:00:10,000 --> 00:00:12,000", "（佐野）5年前 野崎は北京で飛んだ"),
+            ("00:00:12,000 --> 00:00:14,000", "こんにちは"),
+        ],
+    )
+    gloss = Glossary({"野崎": "Nozaki", "佐野": "Sano"})
+
+    class DropSentinel(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            out: list[str] = []
+            for text in texts:
+                if "xx" in text or "<g" in text:
+                    out.append("hace cinco anos en Beijing")
+                else:
+                    out.append("Hola")
+            return out
+
+    doc = load(src)
+    translate_document(doc, to_code="es", from_code="ja", backend=DropSentinel(), glossary=gloss)
+    assert "Nozaki" in doc.cues[0].text
+    assert "野崎" not in doc.cues[0].text
+    assert doc.cues[1].text == "Hola"
+    err = capsys.readouterr().err
+    assert "overlay leftover names" in err
+    assert "finish_reason stop=" in err
+    assert "leftover arrows" in err
+
+
+def test_create_completion_max_tokens_still_256() -> None:
+    llama = RecordingLlama()
+    llama.tokenize = None  # type: ignore[method-assign]
+    backend = GemmaXBackend(device="cpu")
+    backend._llama = llama
+    backend.translate(["こんにちは"], "jpn_Jpan", "spa_Latn")
+    assert llama.kwargs[0]["max_tokens"] == 256
+    assert "create_chat_completion" not in llama.kwargs[0]
