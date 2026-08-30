@@ -404,6 +404,15 @@ def test_translate_subparser_still_works(tmp_path: Path) -> None:
     assert (tmp_path / "file.en.srt").is_file()
 
 
+def test_regex_pin_blocks_lid_downgrade() -> None:
+    """lingua 1.4.2 pulls regex 2024.11.6; transformers 5.16.1 needs >=2025.10.22."""
+    text = Path(__file__).resolve().parents[1].joinpath("pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    assert '"regex>=2025.10.22"' in text
+    assert "lingua-language-detector==1.4.2" in text
+
+
 def test_nllb_src_lang_set_per_encode() -> None:
     from sublocal.backend import NllbBackend, _set_src_lang
 

@@ -26,10 +26,12 @@ cd sublocal
 pip install .
 ```
 
-Short-cue Latin LID when ASR did not stamp lang (optional, local, no API). Package pin is `lingua-language-detector==1.4.2` (2.x needs Python 3.12; this project supports 3.11). Restricted to JA/EN/ES/KO:
+Short-cue Latin LID when ASR did not stamp lang (optional, local, no API). Package pin is `lingua-language-detector==1.4.2` (2.x needs Python 3.12; this project supports 3.11). Restricted to JA/EN/ES/KO. Main deps pin `regex>=2025.10.22` (transformers 5.16); lingua 1.4.2 asks for `regex<2025`, so a strict resolver will refuse `.[lid]` rather than downgrade regex. Install lingua without its regex pin:
 
 ```bash
 pip install ".[lid]"
+# if pip reports a regex conflict:
+pip install --no-deps lingua-language-detector==1.4.2
 ```
 
 Dev / tests:

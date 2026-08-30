@@ -26,6 +26,7 @@ dependencies = [
   "faster-whisper>=1.0.0",
   "huggingface-hub>=0.23.0",
   "langdetect>=1.0.9",
+  "regex>=2025.10.22",
   "sentencepiece>=0.2.0",
   "stable-ts-whisperless>=2.18.0",
   "transformers>=4.40.0",
