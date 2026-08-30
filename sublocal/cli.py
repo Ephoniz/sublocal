@@ -50,7 +50,7 @@ MEDIA_SUFFIXES = frozenset(
 
 _EPILOG = (
     "product:  sublocal INPUT --to LANG   "
-    "transcribe mixed-language audio/video, then NLLB per cue "
+    "transcribe mixed-language audio/video, then GemmaX2 per cue "
     "(writes INPUT.<lang>.srt and INPUT.cues.jsonl). "
     "transcribe / translate remain as debug commands."
 )
@@ -105,9 +105,15 @@ def build_product_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--model",
-        default="3.3b",
-        choices=("small", "3.3b", "large"),
-        help="NLLB size: 3.3b (default) or small (600M). large aliases 3.3b.",
+        default=None,
+        metavar="QUANT",
+        help="GemmaX2 quant: q5 (default Q5_K_M) or q6 (Q6_K). Not NLLB 3.3b.",
+    )
+    parser.add_argument(
+        "--gguf",
+        default=None,
+        metavar="PATH",
+        help="Override GemmaX2 GGUF path (skip Hugging Face download).",
     )
     parser.add_argument(
         "--language",
@@ -122,7 +128,7 @@ def build_product_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--backend",
-        default=os.environ.get("SUBLOCAL_BACKEND", "nllb"),
+        default=os.environ.get("SUBLOCAL_BACKEND", "gemmax"),
         help=argparse.SUPPRESS,
     )
     return parser
@@ -178,9 +184,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tr.add_argument(
         "--model",
-        default="3.3b",
-        choices=("small", "3.3b", "large"),
-        help="NLLB size: 3.3b (default) or small (600M). large aliases 3.3b.",
+        default=None,
+        metavar="QUANT",
+        help="GemmaX2 quant: q5 (default Q5_K_M) or q6 (Q6_K). NLLB sizes need --backend nllb.",
+    )
+    tr.add_argument(
+        "--gguf",
+        default=None,
+        metavar="PATH",
+        help="Override GemmaX2 GGUF path (skip Hugging Face download).",
     )
     tr.add_argument(
         "--device",
@@ -193,11 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=32,
         metavar="N",
-        help="Cues per CTranslate2 batch (default: 32)",
+        help="Cues per CTranslate2 batch (default: 32). GemmaX2 is sequential.",
     )
     tr.add_argument(
         "--backend",
-        default=os.environ.get("SUBLOCAL_BACKEND", "nllb"),
+        default=os.environ.get("SUBLOCAL_BACKEND", "gemmax"),
         help=argparse.SUPPRESS,
     )
 
@@ -253,7 +265,11 @@ def build_parser() -> argparse.ArgumentParser:
 def _cmd_translate(args: argparse.Namespace) -> int:
     try:
         backend = backend_from_name(
-            args.backend, args.device, args.batch_size, model=args.model
+            args.backend,
+            args.device,
+            args.batch_size,
+            model=args.model,
+            gguf=args.gguf,
         )
         out = translate_file(
             args.input,
@@ -310,7 +326,11 @@ def _cmd_transcribe(args: argparse.Namespace) -> int:
 def _cmd_product(args: argparse.Namespace) -> int:
     try:
         backend = backend_from_name(
-            args.backend, args.device, 32, model=args.model
+            args.backend,
+            args.device,
+            32,
+            model=args.model,
+            gguf=args.gguf,
         )
         out = run_product(
             args.input,
@@ -322,6 +342,7 @@ def _cmd_product(args: argparse.Namespace) -> int:
             language=args.language,
             batched=args.batch,
             backend=backend,
+            gguf=args.gguf,
         )
     except (
         FileNotFoundError,

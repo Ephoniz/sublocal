@@ -60,11 +60,12 @@ def test_extract_stub(capsys) -> None:
 def test_cli_translate_model_default_and_small() -> None:
     parser = build_parser()
     default = parser.parse_args(["translate", "in.srt", "--to", "es"])
-    assert default.model == "3.3b"
+    assert default.model is None
+    assert default.backend == "gemmax"
+    q6 = parser.parse_args(["translate", "in.srt", "--to", "es", "--model", "q6"])
+    assert q6.model == "q6"
     small = parser.parse_args(["translate", "in.srt", "--to", "es", "--model", "small"])
     assert small.model == "small"
-    large = parser.parse_args(["translate", "in.srt", "--to", "es", "--model", "large"])
-    assert large.model == "large"
 
 
 def test_cli_passes_model_small_to_backend(
@@ -74,7 +75,7 @@ def test_cli_passes_model_small_to_backend(
 
     seen: dict[str, str | None] = {}
 
-    def fake(name, device, batch_size, model=None):
+    def fake(name, device, batch_size, model=None, gguf=None, name_hint=False):
         seen["model"] = model
         return EchoBackend()
 

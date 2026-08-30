@@ -6,13 +6,19 @@ from types import SimpleNamespace
 import pytest
 
 from sublocal.backend import (
+    DEFAULT_GGUF_FILE,
+    DEFAULT_GGUF_REPO,
     DEFAULT_MODEL_REPO,
     DEFAULT_TOKENIZER_REPO,
+    GEMMAX_Q5_FILE,
+    GEMMAX_REPO,
     SMALL_MODEL_REPO,
     SMALL_TOKENIZER_REPO,
+    GemmaXBackend,
     NllbBackend,
     _compute_type,
     _create_translator,
+    gemmax_quant_spec,
     nllb_model_spec,
 )
 from sublocal.pipeline import backend_from_name
@@ -55,6 +61,28 @@ def test_backend_from_name_model() -> None:
     assert nllb.repo_id == SMALL_MODEL_REPO
     echo = backend_from_name("echo", "cpu", 32, model="3.3b")
     assert echo.__class__.__name__ == "EchoBackend"
+    gemmax = backend_from_name("gemmax", "cpu", 1)
+    assert isinstance(gemmax, GemmaXBackend)
+    assert gemmax.repo_id == GEMMAX_REPO
+    assert gemmax.filename == GEMMAX_Q5_FILE
+    auto = backend_from_name("auto", "cpu", 1)
+    assert isinstance(auto, GemmaXBackend)
+
+
+def test_default_mt_is_gemmax_q5_not_nllb() -> None:
+    assert DEFAULT_GGUF_REPO == "mradermacher/GemmaX2-28-9B-v0.1-GGUF"
+    assert DEFAULT_GGUF_FILE == "GemmaX2-28-9B-v0.1.Q5_K_M.gguf"
+    assert "Q4" not in DEFAULT_GGUF_FILE
+    spec = gemmax_quant_spec()
+    assert spec.filename == GEMMAX_Q5_FILE
+    assert spec.size_hint == "6.65 GB"
+    q6 = gemmax_quant_spec("q6")
+    assert q6.filename.endswith("Q6_K.gguf")
+    default = GemmaXBackend(device="cpu")
+    assert default.filename == GEMMAX_Q5_FILE
+    assert default.repo_id == GEMMAX_REPO
+    with pytest.raises(ValueError, match="not the product default"):
+        gemmax_quant_spec("3.3b")
 
 
 def test_compute_type_cuda_float16_cpu_int8() -> None:
@@ -112,6 +140,47 @@ def test_ensure_loaded_unloads_whisper_before_translator(monkeypatch) -> None:
     backend._ensure_loaded()
     assert order[0] == "unload"
     assert "translator" in order
+
+
+def test_create_llama_oom_retries_n_ctx_1024(monkeypatch, capsys) -> None:
+    from sublocal.backend import _create_llama
+
+    calls: list[int] = []
+
+    class FakeLlama:
+        def __init__(self, model_path, n_gpu_layers, n_ctx, logits_all):
+            calls.append(n_ctx)
+            assert n_gpu_layers == -1
+            assert logits_all is False
+            if n_ctx == 2048:
+                raise RuntimeError("CUDA out of memory")
+
+    monkeypatch.setitem(
+        sys.modules, "llama_cpp", SimpleNamespace(Llama=FakeLlama)
+    )
+    _create_llama("/tmp/fake.gguf", n_ctx=2048)
+    assert calls == [2048, 1024]
+    err = capsys.readouterr().err
+    assert "1024" in err
+
+
+def test_gemmax_ensure_loaded_unloads_whisper_before_llama(monkeypatch) -> None:
+    order: list[str] = []
+
+    def unload(model=None):
+        order.append("unload")
+
+    monkeypatch.setattr("sublocal.transcribe.unload_whisper", unload)
+    monkeypatch.setattr(
+        "sublocal.backend._create_llama",
+        lambda *a, **k: order.append("llama") or object(),
+    )
+    backend = GemmaXBackend(device="cpu")
+    monkeypatch.setattr(backend, "_download_gguf", lambda: "/tmp/fake.gguf")
+    backend._ensure_loaded()
+    assert order[0] == "unload"
+    assert "llama" in order
+    assert order.index("unload") < order.index("llama")
 
 
 def test_create_translator_non_oom_does_not_retry(monkeypatch) -> None:

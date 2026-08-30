@@ -386,7 +386,7 @@ def test_product_cli_parses_media_to() -> None:
     assert args.input == "clip.mp4"
     assert args.to == "es"
     assert args.batch is False
-    assert args.model == "3.3b"
+    assert args.model is None
     assert args.glossary is None
     assert args.language is None
 

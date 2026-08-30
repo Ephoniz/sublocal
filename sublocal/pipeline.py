@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from sublocal.backend import EchoBackend, NllbBackend, TranslatorBackend
+from sublocal.backend import (
+    EchoBackend,
+    GemmaXBackend,
+    NllbBackend,
+    TranslatorBackend,
+)
 from sublocal.cues_jsonl import cues_jsonl_path, langs_from_sidecar, write_cues_jsonl
 from sublocal.detect import DetectionError, detect_iso639
 from sublocal.formats import dumps, load, save
@@ -25,6 +31,7 @@ from sublocal.lid import (
     script_heuristic,
 )
 from sublocal.progress import status
+from sublocal.transcribe import unload_whisper
 
 
 def default_output_path(inp: Path, to_code: str) -> Path:
@@ -101,7 +108,7 @@ def translate_document(
 
     Each cue is encoded with that cue's source language. Cues already in
     ``to_code`` are copied through. Latin/ASCII tokens in non-Latin cues
-    are not sent through NLLB.
+    are not sent through the MT backend.
     """
     cues = doc.cues
     if not cues:
@@ -110,7 +117,7 @@ def translate_document(
     langs = resolve_cue_langs(cues, from_code=from_code, cue_langs=cue_langs)
     tgt = to_flores(to_code)
     if backend is None:
-        backend = NllbBackend()
+        backend = GemmaXBackend()
     gloss = as_glossary(glossary)
     texts = [c.text for c in cues]
     translated: list[str | None] = [None] * len(texts)
@@ -165,6 +172,7 @@ def translate_document(
     else:
         status(f"Translating {send_count} cues (per-cue src → {tgt})")
 
+    started = time.monotonic()
     for src, idxs in groups.items():
         to_send = [texts[i] for i in idxs]
         batch = backend.translate(to_send, src, tgt)
@@ -185,6 +193,7 @@ def translate_document(
                 translated[i] = _with_speaker(speaker_prefix[i], body)
             else:
                 translated[i] = mt
+    status(f"MT pass {time.monotonic() - started:.1f}s")
 
     apply_translations(doc, [t if t is not None else "" for t in translated])
     first_src = to_flores(langs[0]) if langs else tgt
@@ -216,6 +225,7 @@ def translate_file(
     sidecar = cues_jsonl_path(inp)
     if sidecar.is_file():
         cue_langs = langs_from_sidecar(sidecar, doc)
+    unload_whisper()
     translate_document(
         doc,
         to_code=to_code,
@@ -234,12 +244,22 @@ def backend_from_name(
     device: str,
     batch_size: int,
     model: str | None = None,
+    gguf: str | Path | None = None,
+    name_hint: bool = False,
 ) -> TranslatorBackend:
     if name in {"echo", "identity"}:
         return EchoBackend()
-    if name in {"nllb", "auto"}:
+    if name in {"nllb"}:
         return NllbBackend(device=device, batch_size=batch_size, model=model)
-    raise ValueError(f"Unknown backend {name!r}. Use nllb or echo.")
+    if name in {"gemmax", "gemmax2", "auto", "llama", "llama-cpp"}:
+        return GemmaXBackend(
+            device=device,
+            batch_size=batch_size,
+            model=model,
+            gguf=gguf,
+            name_hint=name_hint,
+        )
+    raise ValueError(f"Unknown backend {name!r}. Use gemmax, nllb, or echo.")
 
 
 def product_output_path(inp: Path, to_code: str) -> Path:
@@ -259,8 +279,10 @@ def run_product(
     batched: bool = False,
     backend: TranslatorBackend | None = None,
     whisper_model: str = "large-v3",
+    gguf: str | Path | None = None,
+    name_hint: bool = False,
 ) -> Path:
-    """Transcribe mixed-language media, unload Whisper, NLLB per cue.
+    """Transcribe mixed-language media, unload Whisper, GemmaX2 per cue.
 
     Writes ``INPUT.cues.jsonl`` and ``INPUT.<to>.srt``. No default glossary.
     Whisper ``task=translate`` is never used.
@@ -280,8 +302,11 @@ def run_product(
         batched=batched,
     )
     write_cues_jsonl(doc, cues_jsonl_path(inp))
+    unload_whisper()
     if backend is None:
-        backend = NllbBackend(device=device, model=model)
+        backend = GemmaXBackend(
+            device=device, model=model, gguf=gguf, name_hint=name_hint
+        )
     cue_langs = [c.extra.get("lang") for c in doc.cues]
     translate_document(
         doc,
