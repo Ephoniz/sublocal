@@ -51,42 +51,63 @@ def translate_document(
         backend = NllbBackend()
     gloss = as_glossary(glossary)
     texts = [c.text for c in cues]
-    protected_pairs: list[list[tuple[str, str]]] = [[] for _ in texts]
-    local_only = [False] * len(texts)
-    if gloss is not None:
-        protected: list[str] = []
-        for i, text in enumerate(texts):
-            guarded, pairs = gloss.protect(text)
-            protected.append(guarded)
-            protected_pairs[i] = pairs
-            if pairs and not needs_nllb(guarded):
-                local_only[i] = True
-        texts = protected
-    send_idx = [i for i, skip in enumerate(local_only) if not skip]
-    to_send = [texts[i] for i in send_idx]
-    if gloss is not None:
-        to_send = [gloss.pad_sentinels(t) for t in to_send]
     prepare = getattr(backend, "prepare", None)
-    if callable(prepare) and to_send:
+    if gloss is None:
+        if callable(prepare):
+            prepare()
+        status(f"Translating {len(texts)} cues ({src} → {tgt})")
+        translated = backend.translate(texts, src, tgt)
+        apply_translations(doc, translated)
+        return doc, src, tgt
+
+    protected: list[str] = []
+    protected_pairs: list[list[tuple[str, str]]] = []
+    local_only: list[bool] = []
+    for text in texts:
+        guarded, pairs = gloss.protect(text)
+        protected.append(guarded)
+        protected_pairs.append(pairs)
+        local_only.append(bool(pairs) and not needs_nllb(guarded))
+
+    frag_counts: list[int] = []
+    all_frags: list[str] = []
+    n_sent = 0
+    for guarded, skip in zip(protected, local_only, strict=True):
+        if skip:
+            frag_counts.append(0)
+            continue
+        pieces = gloss.fragment_texts(guarded)
+        frag_counts.append(len(pieces))
+        all_frags.extend(pieces)
+        n_sent += 1
+
+    if callable(prepare) and all_frags:
         prepare()
-    status(f"Translating {len(to_send)} cues ({src} → {tgt})")
-    translated = list(texts)
-    if to_send:
-        batch = backend.translate(to_send, src, tgt)
-        if len(batch) != len(to_send):
+    status(f"Translating {n_sent} cues ({src} → {tgt})")
+    batch: list[str] = []
+    if all_frags:
+        batch = backend.translate(all_frags, src, tgt)
+        if len(batch) != len(all_frags):
             raise RuntimeError(
-                f"Translator returned {len(batch)} texts for {len(to_send)} cues."
+                f"Translator returned {len(batch)} texts for {len(all_frags)} fragments."
             )
-        for i, text in zip(send_idx, batch, strict=True):
-            translated[i] = text
-    if gloss is not None:
-        restored: list[str] = []
-        for i, text in enumerate(translated):
-            try:
-                restored.append(gloss.restore(text, protected_pairs[i], target="value"))
-            except GlossaryError as exc:
-                raise GlossaryError(f"Cue {i + 1}: {exc}") from exc
-        translated = restored
+
+    translated: list[str] = []
+    offset = 0
+    for i, (guarded, pairs, skip, n_frags) in enumerate(
+        zip(protected, protected_pairs, local_only, frag_counts, strict=True)
+    ):
+        try:
+            if skip:
+                translated.append(gloss.restore(guarded, pairs, target="value"))
+            else:
+                chunk = batch[offset : offset + n_frags]
+                offset += n_frags
+                translated.append(
+                    gloss.stitch(guarded, chunk, pairs, target="value")
+                )
+        except GlossaryError as exc:
+            raise GlossaryError(f"Cue {i + 1}: {exc}") from exc
     apply_translations(doc, translated)
     return doc, src, tgt
 

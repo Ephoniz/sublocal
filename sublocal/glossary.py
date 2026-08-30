@@ -5,8 +5,9 @@ before translation. Injecting Latin (Drum, Nozaki) into Japanese is how
 ドラム became tambor — the model then "translates" the English word.
 
 Algorithm: longest-first replace of JP keys with opaque ASCII sentinels
-``xx{n}xx``, translate the protected strings, restore sentinels by exact
-match. A missing sentinel fails the cue; names are never silently dropped.
+``xx{n}xx``. Cues with no leftover kanji restore locally. Other cues split
+on ``(xx\\d+xx)``; only JP fragments go to NLLB, then Latin values are
+stitched back. Names never enter the model.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from typing import Literal
 # Mutations NLLB sometimes emits around the opaque sentinel.
 _SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
 _EXACT_SENTINEL_RE = re.compile(r"xx(\d+)xx", re.IGNORECASE)
+# Capturing split so sentinels stay in the parts list.
+_SENTINEL_SPLIT_RE = re.compile(r"(xx\d+xx)", re.IGNORECASE)
 
 # CJK Unified Ideographs (incl. compatibility). Hiragana/katakana do not match.
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -117,21 +120,53 @@ class Glossary:
                 start = idx + len(token)
         return out, pairs
 
-    def pad_sentinels(self, protected: str) -> str:
-        """Insert spaces around ``xxNxx`` so NLLB does not swallow a glued name.
+    def split_parts(self, protected: str) -> list[str]:
+        """Split on capturing ``(xx\\d+xx)``, keeping sentinels as parts."""
+        return _SENTINEL_SPLIT_RE.split(protected)
 
-        ``いいかxx0xx`` → ``いいか xx0xx``. Already-spaced sentinels are left
-        as-is. Skip-NLLB cues must not be padded; they restore locally.
-        """
+    def is_sentinel(self, part: str) -> bool:
+        return bool(_EXACT_SENTINEL_RE.fullmatch(part))
 
-        def _pad(match: re.Match[str]) -> str:
-            start, end = match.span()
-            token = f"xx{int(match.group(1))}xx"
-            left = "" if start == 0 or protected[start - 1].isspace() else " "
-            right = "" if end == len(protected) or protected[end].isspace() else " "
-            return f"{left}{token}{right}"
+    def fragment_texts(self, protected: str) -> list[str]:
+        """Non-sentinel, non-empty JP pieces to send to NLLB."""
+        return [
+            part
+            for part in self.split_parts(protected)
+            if part.strip() and not self.is_sentinel(part)
+        ]
 
-        return _EXACT_SENTINEL_RE.sub(_pad, protected)
+    def stitch(
+        self,
+        protected: str,
+        translated_fragments: list[str],
+        pairs: list[tuple[str, str]],
+        *,
+        target: Literal["value", "key"] = "value",
+    ) -> str:
+        """Rebuild a cue: translated JP fragments + Latin (or JP) names."""
+        pieces = iter(translated_fragments)
+        out: list[str] = []
+        for part in self.split_parts(protected):
+            matched = _EXACT_SENTINEL_RE.fullmatch(part)
+            if matched:
+                n = int(matched.group(1))
+                if not (0 <= n < len(pairs)):
+                    raise GlossaryError(
+                        f"Glossary sentinel {part!r} has no mapping"
+                    )
+                key, value = pairs[n]
+                out.append(key if target == "key" else value)
+                continue
+            if part.strip():
+                try:
+                    out.append(next(pieces))
+                except StopIteration as exc:
+                    raise GlossaryError(
+                        "Missing translated fragment while stitching glossary cue"
+                    ) from exc
+            else:
+                out.append(part)
+        return "".join(out)
 
     def restore(
         self,

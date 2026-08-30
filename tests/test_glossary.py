@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -79,14 +80,19 @@ def test_needs_nllb_true_for_real_dialogue() -> None:
     assert needs_nllb(protected) is True
 
 
-def test_pad_sentinels_spaces_glued_name() -> None:
+def test_fragment_stitch_glued_name() -> None:
     g = _drama()
     protected, pairs = g.protect("＜いいか東条\nこれから聞くことに素直に答えれば＞")
     assert "いいかxx0xx" in protected
-    padded = g.pad_sentinels(protected)
-    assert "いいか xx0xx" in padded
-    assert "いいかxx0xx" not in padded
-    assert g.restore(padded, pairs) == "＜いいか Tojo\nこれから聞くことに素直に答えれば＞"
+    frags = g.fragment_texts(protected)
+    assert frags
+    assert all(not re.search(r"xx\d+xx", f) for f in frags)
+    assert any("いいか" in f for f in frags)
+    assert any("聞く" in f for f in frags)
+    stitched = g.stitch(protected, frags, pairs)
+    assert "Tojo" in stitched
+    assert "いいか" in stitched
+    assert "xx" not in stitched
 
 
 def test_restore_accepts_spaced_and_cased_sentinels() -> None:
@@ -125,7 +131,7 @@ def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
     assert particle_protected not in seen
     assert all("Drum" not in t for t in seen)
     assert all("ドラム" not in t for t in seen)
-    assert any("xx" in t for t in seen)
+    assert all(not re.search(r"xx\d+xx", t, re.I) for t in seen)
     assert any("起き" in t for t in seen)
     doc = load(out)
     assert "Drum" in doc.cues[0].text
@@ -137,7 +143,7 @@ def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
     assert "起き" in doc.cues[1].text
 
 
-def test_glued_kanji_cue_is_padded_before_nllb(tmp_path: Path) -> None:
+def test_glued_kanji_cue_sends_fragments_not_sentinels(tmp_path: Path) -> None:
     src = tmp_path / "glued.srt"
     src.write_text(
         "13\n"
@@ -166,8 +172,11 @@ def test_glued_kanji_cue_is_padded_before_nllb(tmp_path: Path) -> None:
         glossary=DRAMA,
     )
     assert seen
-    assert any("いいか xx0xx" in t for t in seen)
-    assert all("いいかxx0xx" not in t for t in seen)
+    assert all("Drum" not in t for t in seen)
+    assert all("ドラム" not in t for t in seen)
+    assert all(not re.search(r"xx\d+xx", t, re.I) for t in seen)
+    assert any("いいか" in t for t in seen)
+    assert any("聞く" in t for t in seen)
     assert all("ううっ" not in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
@@ -175,29 +184,6 @@ def test_glued_kanji_cue_is_padded_before_nllb(tmp_path: Path) -> None:
     assert "聞く" in doc.cues[0].text
     assert "Tojo" in doc.cues[1].text
     assert "ううっ" in doc.cues[1].text
-
-
-def test_kanji_cue_missing_sentinel_after_padding_fails(tmp_path: Path) -> None:
-    src = tmp_path / "drop.srt"
-    src.write_text(
-        "1\n00:00:00,000 --> 00:00:02,000\nいいか東条 まだ起きねえのか？\n",
-        encoding="utf-8",
-    )
-    out = tmp_path / "drop.es.srt"
-
-    class Drop(EchoBackend):
-        def translate(self, texts, src_flores, tgt_flores):
-            return ["tambor" for _ in texts]
-
-    with pytest.raises(GlossaryError, match="xx0xx"):
-        translate_file(
-            src,
-            to_code="es",
-            from_code="ja",
-            output_path=out,
-            backend=Drop(),
-            glossary=DRAMA,
-        )
 
 
 def test_restore_to_japanese_keys() -> None:
@@ -238,8 +224,9 @@ def test_groan_cue_skips_nllb_dialogue_still_sent(tmp_path: Path, capsys) -> Non
     assert "Translating 1 cues" in err
     assert seen
     assert all("ううっ" not in t for t in seen)
-    assert all("（xx0xx）" not in t and "（xx0xx)" not in t for t in seen)
-    assert any("xx" in t for t in seen)
+    assert all("Drum" not in t for t in seen)
+    assert all("ドラム" not in t for t in seen)
+    assert all(not re.search(r"xx\d+xx", t, re.I) for t in seen)
     assert any("起き" in t or "おい" in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
