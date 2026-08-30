@@ -121,6 +121,63 @@ def test_echo_full_cue_strips_particles(tmp_path: Path) -> None:
     assert "バンコク" not in text
 
 
+def test_peel_speaker_allows_leading_bracket() -> None:
+    g = _drama()
+    name, rest = g.peel_speaker(
+        "《（野崎）この中に直前でフライトの時間が変更した便はあるか？》"
+    )
+    assert name == "野崎"
+    assert "野崎" not in rest
+    assert "フライト" in rest
+    assert rest.startswith("この中に")
+
+
+def test_bracketed_speaker_plus_kanji_body(tmp_path: Path) -> None:
+    src = tmp_path / "c28.srt"
+    src.write_text(
+        "28\n"
+        "00:00:40,000 --> 00:00:44,000\n"
+        "《（野崎）この中に直前でフライトの時間が変更した便はあるか？》\n"
+        "\n"
+        "38\n"
+        "00:00:50,000 --> 00:00:54,000\n"
+        "（東条）野崎に / 新庄がバンコクに飛んだ\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "c28.es.srt"
+    seen: list[str] = []
+
+    class Recorder(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            seen.extend(texts)
+            return super().translate(texts, src_flores, tgt_flores)
+
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=Recorder(),
+        glossary=DRAMA,
+    )
+    assert seen
+    assert all("野崎" not in t for t in seen)
+    assert all("東条" not in t for t in seen)
+    assert any("フライト" in t or "変更" in t for t in seen)
+    assert any("に飛んだ" in t for t in seen)
+    doc = load(out)
+    assert doc.cues[0].text.startswith("(Nozaki)")
+    assert "野崎" not in doc.cues[0].text
+    assert "フライト" in doc.cues[0].text or "変更" in doc.cues[0].text
+    assert doc.cues[1].text.startswith("(Tojo)")
+    assert "Tojo" in doc.cues[1].text
+    assert "Nozaki" in doc.cues[1].text
+    assert "Shinjo" in doc.cues[1].text
+    assert "Bangkok" in doc.cues[1].text
+    assert "東条" not in doc.cues[1].text
+    assert "バンコク" not in doc.cues[1].text
+
+
 def test_yoh_vocative_restores_locally(tmp_path: Path) -> None:
     src = tmp_path / "yoh.srt"
     src.write_text(

@@ -71,21 +71,23 @@ def translate_document(
     to_send: list[str] = []
     guarded_by_i: list[str] = [""] * len(texts)
     pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
+    speaker_prefix: list[str | None] = [None] * len(texts)
 
     for i, text in enumerate(texts):
         speaker_jp, rest = gloss.peel_speaker(text)
-        if speaker_jp is not None and not has_cjk(rest):
-            latin = gloss.mapping[speaker_jp]
-            translated[i] = f"({latin})"
-            continue
+        if speaker_jp is not None:
+            speaker_prefix[i] = f"({gloss.mapping[speaker_jp]})"
+            if not has_cjk(rest):
+                translated[i] = speaker_prefix[i] or ""
+                continue
+            text = rest
         guarded, pairs = gloss.protect(text)
         guarded_by_i[i] = guarded
         pairs_by_i[i] = pairs
         if pairs and not needs_nllb(guarded):
             restored = gloss.restore(guarded, pairs, target="value")
-            translated[i] = gloss.cleanup_adjacent(
-                restored, [v for _, v in pairs]
-            )
+            body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
+            translated[i] = _with_speaker(speaker_prefix[i], body)
             continue
         send_idx.append(i)
         to_send.append(guarded)
@@ -105,7 +107,7 @@ def translate_document(
         pairs = pairs_by_i[i]
         mt = batch[j]
         if not pairs:
-            translated[i] = mt
+            translated[i] = _with_speaker(speaker_prefix[i], mt)
             continue
         try:
             if gloss.missing_sentinels(mt, pairs):
@@ -117,9 +119,18 @@ def translate_document(
             restored = gloss.restore(mt, pairs, target="value")
         except GlossaryError as exc:
             raise GlossaryError(f"Cue {i + 1}: {exc}") from exc
-        translated[i] = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
+        body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
+        translated[i] = _with_speaker(speaker_prefix[i], body)
     apply_translations(doc, translated)
     return doc, src, tgt
+
+
+def _with_speaker(prefix: str | None, body: str) -> str:
+    if not prefix:
+        return body
+    if not body:
+        return prefix
+    return f"{prefix} {body}"
 
 
 def translate_file(

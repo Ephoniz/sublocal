@@ -21,7 +21,8 @@ from typing import Literal
 _GLS_RE = re.compile(r"GLS\s*(\d+)", re.IGNORECASE)
 _XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
-_SPEAKER_RE = re.compile(r"^[（(]([^）)]+)[）)]\s*")
+_SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
+_WRAPPERS = "《》＜＞「」『』"
 _PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい", "よう")
 _BRACKETS = "《》＜＞「」"
 
@@ -106,14 +107,18 @@ class Glossary:
         return " ".join(self.source_keys())
 
     def peel_speaker(self, text: str) -> tuple[str | None, str]:
-        """If the cue starts with （glossary-name）, return ``(jp_name, rest)``."""
+        """If the cue starts with optional 《＜「『 then （glossary-name）.
+
+        Returns ``(jp_name, rest)``. Rest has leftover wrapper brackets stripped.
+        """
         match = _SPEAKER_RE.match(text)
         if not match:
             return None, text
         inner = match.group(1).strip()
-        if inner in self.mapping:
-            return inner, text[match.end() :]
-        return None, text
+        if inner not in self.mapping:
+            return None, text
+        rest = text[match.end() :].strip().strip(_WRAPPERS).strip()
+        return inner, rest
 
     def protect(self, text: str) -> tuple[str, list[tuple[str, str]]]:
         """Replace each JP key with spaced ``GLS{n}``. Never inject Latin.
