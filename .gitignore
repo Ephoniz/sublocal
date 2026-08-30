@@ -21,3 +21,6 @@ graft/
 # Local model / HF caches if someone points them at the repo
 .cache/
 .huggingface/
+
+# Local prove videos (never commit)
+/TEST-FILES/
