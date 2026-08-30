@@ -61,20 +61,22 @@ def test_missing_sentinel_fails() -> None:
         g.restore("tambor", pairs)
 
 
-def test_needs_nllb_false_for_speaker_tag_groan() -> None:
+def test_needs_nllb_false_without_cjk_remainder() -> None:
     g = _drama()
-    protected, pairs = g.protect("（東条）ううっ あっ あっ…")
+    groan, pairs = g.protect("（東条）ううっ あっ あっ…")
     assert pairs
-    assert "xx0xx" in protected
-    assert needs_nllb(protected) is False
+    assert "xx0xx" in groan
+    assert needs_nllb(groan) is False
+    particles, _ = g.protect("野崎のドラムとバンコク")
+    assert needs_nllb(particles) is False
+    vocative, _ = g.protect("＜よう 東条＞")
+    assert needs_nllb(vocative) is False
 
 
 def test_needs_nllb_true_for_real_dialogue() -> None:
     g = _drama()
     protected, _pairs = g.protect("おい ドラム 東条 まだ起きねえのか？")
     assert needs_nllb(protected) is True
-    particles, _ = g.protect("野崎のドラムとバンコク")
-    assert needs_nllb(particles) is True
 
 
 def test_restore_accepts_spaced_and_cased_sentinels() -> None:
@@ -87,7 +89,9 @@ def test_restore_accepts_spaced_and_cased_sentinels() -> None:
 def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
     src = tmp_path / "ja.srt"
     src.write_text(
-        "1\n00:00:00,000 --> 00:00:01,000\n野崎のドラムとバンコク\n",
+        "1\n00:00:00,000 --> 00:00:01,000\n野崎のドラムとバンコク\n"
+        "\n"
+        "2\n00:00:01,000 --> 00:00:03,000\nおい ドラム 東条 まだ起きねえのか？\n",
         encoding="utf-8",
     )
     out = tmp_path / "ja.es.srt"
@@ -106,15 +110,21 @@ def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
         backend=Recorder(),
         glossary=DRAMA,
     )
+    particle_protected, _ = _drama().protect("野崎のドラムとバンコク")
     assert seen
+    assert particle_protected not in seen
     assert all("Drum" not in t for t in seen)
     assert all("ドラム" not in t for t in seen)
     assert any("xx" in t for t in seen)
+    assert any("起き" in t for t in seen)
     doc = load(out)
     assert "Drum" in doc.cues[0].text
     assert "Nozaki" in doc.cues[0].text
     assert "Bangkok" in doc.cues[0].text
     assert "ドラム" not in doc.cues[0].text
+    assert "Drum" in doc.cues[1].text
+    assert "Tojo" in doc.cues[1].text
+    assert "起き" in doc.cues[1].text
 
 
 def test_restore_to_japanese_keys() -> None:

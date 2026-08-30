@@ -18,18 +18,8 @@ from typing import Literal
 # Mutations NLLB sometimes emits around the opaque sentinel.
 _SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
 
-# Whitespace, speaker-tag brackets, quotes, ellipsis, and JP/ASCII punctuation.
-_SPLIT_RE = re.compile(
-    r"[\s"
-    r"（）()＜＞《》〈〉【】\[\]『』「」"
-    r"\"'“”‘’«»"
-    r"…⋯・。．.!?！？ー\-~,~～,，]"
-    r"+"
-)
-
-# Groans: うっ+ / あっ+ / えっ+ (also ううっ = う+っ+), ああ+ / ええ+ / ん+ / だっ+ / ヒー+.
-# ー is also a split char, so ヒー collapses to ヒ after tokenize.
-_GROAN_RE = re.compile(r"^(?:う+っ+|あ+っ+|え+っ+|ああ+|ええ+|ん+|だっ+|ヒー+|ヒ)$")
+# CJK Unified Ideographs (incl. compatibility). Hiragana/katakana do not match.
+_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 
 
 class GlossaryError(RuntimeError):
@@ -53,20 +43,13 @@ def canonicalize_sentinels(text: str, pair_count: int) -> str:
 
 
 def needs_nllb(protected: str) -> bool:
-    """True if leftover tokens after stripping sentinels are real dialogue.
+    """True iff a CJK ideograph remains after stripping ``xxNxx``.
 
-    Groan-only remainders (うっ / あっ / …) are False so speaker-tag cries
-    are restored locally instead of being sent to NLLB, which drops ``xxNxx``.
-    Particles such as の / と still return True.
+    Groans, vocatives (よう), and particle leftovers (のと) are False —
+    restore names locally. Real dialogue (起き, 飛んだ) still goes to NLLB.
     """
     stripped = _SENTINEL_MUTATION_RE.sub("", protected)
-    for token in _SPLIT_RE.split(stripped):
-        if not token:
-            continue
-        if _GROAN_RE.fullmatch(token):
-            continue
-        return True
-    return False
+    return _CJK_RE.search(stripped) is not None
 
 
 def load_mapping(path: str | Path) -> dict[str, str]:
