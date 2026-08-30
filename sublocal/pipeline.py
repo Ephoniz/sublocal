@@ -8,7 +8,7 @@ from sublocal.backend import EchoBackend, NllbBackend, TranslatorBackend
 from sublocal.detect import detect_iso639
 from sublocal.formats import dumps, load, save
 from sublocal.formats.base import Document
-from sublocal.glossary import Glossary, GlossaryError, as_glossary, needs_nllb
+from sublocal.glossary import Glossary, GlossaryError, as_glossary, has_cjk
 from sublocal.languages import display_code, to_flores
 from sublocal.progress import status
 
@@ -60,54 +60,52 @@ def translate_document(
         apply_translations(doc, translated)
         return doc, src, tgt
 
-    protected: list[str] = []
-    protected_pairs: list[list[tuple[str, str]]] = []
-    local_only: list[bool] = []
-    for text in texts:
-        guarded, pairs = gloss.protect(text)
-        protected.append(guarded)
-        protected_pairs.append(pairs)
-        local_only.append(bool(pairs) and not needs_nllb(guarded))
+    translated = [""] * len(texts)
+    send_idx: list[int] = []
+    to_send: list[str] = []
+    guarded_by_i: list[str] = [""] * len(texts)
+    pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
 
-    frag_counts: list[int] = []
-    all_frags: list[str] = []
-    n_sent = 0
-    for guarded, skip in zip(protected, local_only, strict=True):
-        if skip:
-            frag_counts.append(0)
+    for i, text in enumerate(texts):
+        speaker_jp, rest = gloss.peel_speaker(text)
+        if speaker_jp is not None and not has_cjk(rest):
+            latin = gloss.mapping[speaker_jp]
+            translated[i] = f"({latin})"
             continue
-        pieces = gloss.fragment_texts(guarded)
-        frag_counts.append(len(pieces))
-        all_frags.extend(pieces)
-        n_sent += 1
+        guarded, pairs = gloss.protect(text)
+        guarded_by_i[i] = guarded
+        pairs_by_i[i] = pairs
+        send_idx.append(i)
+        to_send.append(guarded)
 
-    if callable(prepare) and all_frags:
+    if callable(prepare) and to_send:
         prepare()
-    status(f"Translating {n_sent} cues ({src} → {tgt})")
+    status(f"Translating {len(to_send)} cues ({src} → {tgt})")
     batch: list[str] = []
-    if all_frags:
-        batch = backend.translate(all_frags, src, tgt)
-        if len(batch) != len(all_frags):
+    if to_send:
+        batch = backend.translate(to_send, src, tgt)
+        if len(batch) != len(to_send):
             raise RuntimeError(
-                f"Translator returned {len(batch)} texts for {len(all_frags)} fragments."
+                f"Translator returned {len(batch)} texts for {len(to_send)} cues."
             )
 
-    translated: list[str] = []
-    offset = 0
-    for i, (guarded, pairs, skip, n_frags) in enumerate(
-        zip(protected, protected_pairs, local_only, frag_counts, strict=True)
-    ):
+    for j, i in enumerate(send_idx):
+        pairs = pairs_by_i[i]
+        mt = batch[j]
+        if not pairs:
+            translated[i] = mt
+            continue
         try:
-            if skip:
-                translated.append(gloss.restore(guarded, pairs, target="value"))
-            else:
-                chunk = batch[offset : offset + n_frags]
-                offset += n_frags
-                translated.append(
-                    gloss.stitch(guarded, chunk, pairs, target="value")
-                )
+            if gloss.missing_sentinels(mt, pairs):
+                xml = gloss.to_xml(guarded_by_i[i], len(pairs))
+                retried = backend.translate([xml], src, tgt)
+                if len(retried) != 1:
+                    raise RuntimeError("XML glossary retry returned the wrong count.")
+                mt = retried[0]
+            restored = gloss.restore(mt, pairs, target="value")
         except GlossaryError as exc:
             raise GlossaryError(f"Cue {i + 1}: {exc}") from exc
+        translated[i] = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
     apply_translations(doc, translated)
     return doc, src, tgt
 

@@ -4,10 +4,11 @@ NLLB has no prompt, so proper names must be pulled out of the source string
 before translation. Injecting Latin (Drum, Nozaki) into Japanese is how
 ドラム became tambor — the model then "translates" the English word.
 
-Algorithm: longest-first replace of JP keys with opaque ASCII sentinels
-``xx{n}xx``. Cues with no leftover kanji restore locally. Other cues split
-on ``(xx\\d+xx)``; only JP fragments go to NLLB, then Latin values are
-stitched back. Names never enter the model.
+Protect longest-first with spaced ``GLS{n}`` tokens and send the FULL cue
+so particles (に飛んだ) stay in the same sentence as the name. Restore
+``GLS{n}`` (also ``GLS n`` / ``gls0`` / ``<g{n}>``) to Latin. Never
+fragment-split: that left おい/に/が untranslated and turned に飛んだ
+into “the moon”.
 """
 
 from __future__ import annotations
@@ -16,14 +17,13 @@ import re
 from pathlib import Path
 from typing import Literal
 
-# Mutations NLLB sometimes emits around the opaque sentinel.
-_SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
-_EXACT_SENTINEL_RE = re.compile(r"xx(\d+)xx", re.IGNORECASE)
-# Capturing split so sentinels stay in the parts list.
-_SENTINEL_SPLIT_RE = re.compile(r"(xx\d+xx)", re.IGNORECASE)
-
-# CJK Unified Ideographs (incl. compatibility). Hiragana/katakana do not match.
+# Copy-stable MT token. Also accept spaced/cased mutations and XML retry tags.
+_GLS_RE = re.compile(r"GLS\s*(\d+)", re.IGNORECASE)
+_XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_SPEAKER_RE = re.compile(r"^[（(]([^）)]+)[）)]\s*")
+_PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい")
+_BRACKETS = "《》＜＞「」"
 
 
 class GlossaryError(RuntimeError):
@@ -31,11 +31,15 @@ class GlossaryError(RuntimeError):
 
 
 def _sentinel(n: int) -> str:
-    return f"xx{n}xx"
+    return f"GLS{n}"
+
+
+def _xml_sentinel(n: int) -> str:
+    return f"<g{n}>"
 
 
 def canonicalize_sentinels(text: str, pair_count: int) -> str:
-    """Normalize ``xx 0 xx`` / ``XX0XX`` to ``xx{n}xx`` when ``n`` is in range."""
+    """Normalize ``GLS 0`` / ``gls0`` / ``<g0>`` to ``GLS{n}`` when in range."""
 
     def _canon(match: re.Match[str]) -> str:
         n = int(match.group(1))
@@ -43,17 +47,21 @@ def canonicalize_sentinels(text: str, pair_count: int) -> str:
             return _sentinel(n)
         return match.group(0)
 
-    return _SENTINEL_MUTATION_RE.sub(_canon, text)
+    out = _XML_RE.sub(_canon, text)
+    return _GLS_RE.sub(_canon, out)
+
+
+def _strip_sentinels(text: str) -> str:
+    return _GLS_RE.sub("", _XML_RE.sub("", text))
 
 
 def needs_nllb(protected: str) -> bool:
-    """True iff a CJK ideograph remains after stripping ``xxNxx``.
+    """True iff a CJK ideograph remains after stripping GLS / ``<gN>`` tokens."""
+    return _CJK_RE.search(_strip_sentinels(protected)) is not None
 
-    Groans, vocatives (よう), and particle leftovers (のと) are False —
-    restore names locally. Real dialogue (起き, 飛んだ) still goes to NLLB.
-    """
-    stripped = _SENTINEL_MUTATION_RE.sub("", protected)
-    return _CJK_RE.search(stripped) is not None
+
+def has_cjk(text: str) -> bool:
+    return _CJK_RE.search(text) is not None
 
 
 def load_mapping(path: str | Path) -> dict[str, str]:
@@ -78,7 +86,7 @@ def load_mapping(path: str | Path) -> dict[str, str]:
 
 
 class Glossary:
-    """Longest-first JP → sentinel protection and restore."""
+    """Longest-first JP → ``GLS{n}`` protection and restore."""
 
     def __init__(self, mapping: dict[str, str]) -> None:
         if not mapping:
@@ -97,12 +105,21 @@ class Glossary:
     def whisper_prompt(self) -> str:
         return " ".join(self.source_keys())
 
-    def protect(self, text: str) -> tuple[str, list[tuple[str, str]]]:
-        """Replace each JP key with ``xx{n}xx``. Never inject Latin values.
+    def peel_speaker(self, text: str) -> tuple[str | None, str]:
+        """If the cue starts with （glossary-name）, return ``(jp_name, rest)``."""
+        match = _SPEAKER_RE.match(text)
+        if not match:
+            return None, text
+        inner = match.group(1).strip()
+        if inner in self.mapping:
+            return inner, text[match.end() :]
+        return None, text
 
-        Returns ``(protected_text, [(source_jp, target_latin), ...])`` in
-        replacement order. Keys are applied longest-first so
-        ウラジオストク is not eaten by a shorter substring.
+    def protect(self, text: str) -> tuple[str, list[tuple[str, str]]]:
+        """Replace each JP key with spaced ``GLS{n}``. Never inject Latin.
+
+        ``バンコクに飛んだ`` → ``GLS0 に飛んだ`` (に飛んだ stays in the same
+        string). ``おい ドラム 東条 …`` → ``おい GLS0 GLS1 …``.
         """
         pairs: list[tuple[str, str]] = []
         out = text
@@ -114,59 +131,24 @@ class Glossary:
                 idx = out.find(key, start)
                 if idx < 0:
                     break
-                token = _sentinel(len(pairs))
+                token = f" {_sentinel(len(pairs))} "
                 out = out[:idx] + token + out[idx + len(key) :]
                 pairs.append((key, value))
                 start = idx + len(token)
-        return out, pairs
+        out = re.sub(r"[^\S\n]+", " ", out)
+        out = re.sub(r" *\n *", "\n", out)
+        return out.strip(), pairs
 
-    def split_parts(self, protected: str) -> list[str]:
-        """Split on capturing ``(xx\\d+xx)``, keeping sentinels as parts."""
-        return _SENTINEL_SPLIT_RE.split(protected)
+    def to_xml(self, protected: str, pair_count: int) -> str:
+        """Retry form: ``GLS{n}`` → ``<g{n}>``."""
+        canon = canonicalize_sentinels(protected, pair_count)
+        for i in range(pair_count):
+            canon = canon.replace(_sentinel(i), _xml_sentinel(i))
+        return canon
 
-    def is_sentinel(self, part: str) -> bool:
-        return bool(_EXACT_SENTINEL_RE.fullmatch(part))
-
-    def fragment_texts(self, protected: str) -> list[str]:
-        """Non-sentinel, non-empty JP pieces to send to NLLB."""
-        return [
-            part
-            for part in self.split_parts(protected)
-            if part.strip() and not self.is_sentinel(part)
-        ]
-
-    def stitch(
-        self,
-        protected: str,
-        translated_fragments: list[str],
-        pairs: list[tuple[str, str]],
-        *,
-        target: Literal["value", "key"] = "value",
-    ) -> str:
-        """Rebuild a cue: translated JP fragments + Latin (or JP) names."""
-        pieces = iter(translated_fragments)
-        out: list[str] = []
-        for part in self.split_parts(protected):
-            matched = _EXACT_SENTINEL_RE.fullmatch(part)
-            if matched:
-                n = int(matched.group(1))
-                if not (0 <= n < len(pairs)):
-                    raise GlossaryError(
-                        f"Glossary sentinel {part!r} has no mapping"
-                    )
-                key, value = pairs[n]
-                out.append(key if target == "key" else value)
-                continue
-            if part.strip():
-                try:
-                    out.append(next(pieces))
-                except StopIteration as exc:
-                    raise GlossaryError(
-                        "Missing translated fragment while stitching glossary cue"
-                    ) from exc
-            else:
-                out.append(part)
-        return "".join(out)
+    def missing_sentinels(self, text: str, pairs: list[tuple[str, str]]) -> list[int]:
+        canon = canonicalize_sentinels(text, len(pairs))
+        return [i for i in range(len(pairs)) if _sentinel(i) not in canon]
 
     def restore(
         self,
@@ -187,6 +169,24 @@ class Glossary:
             replacement = key if target == "key" else value
             out = out.replace(token, replacement)
         return out
+
+    def cleanup_adjacent(self, text: str, latin_values: list[str]) -> str:
+        """Strip leftover JP particles/brackets next to restored Latin names."""
+        if not latin_values:
+            return text
+        particle = "|".join(re.escape(p) for p in sorted(_PARTICLES, key=len, reverse=True))
+        brackets = re.escape(_BRACKETS)
+        out = text
+        for latin in sorted(set(latin_values), key=len, reverse=True):
+            if not latin:
+                continue
+            name = re.escape(latin)
+            out = re.sub(rf"({name})\s*(?:{particle})", r"\1", out)
+            out = re.sub(rf"(?:{particle})\s*({name})", r"\1", out)
+            out = re.sub(rf"[{brackets}]\s*({name})", r"\1", out)
+            out = re.sub(rf"({name})\s*[{brackets}]", r"\1", out)
+        out = re.sub(r"[^\S\n]+", " ", out)
+        return out.strip()
 
 
 def as_glossary(glossary: Glossary | str | Path | None) -> Glossary | None:
