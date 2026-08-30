@@ -9,16 +9,14 @@ from sublocal.detect import DetectionError
 from sublocal.formats import UnsupportedFormatError
 from sublocal.languages import UnknownLanguageError
 from sublocal.device import CudaUnavailableError, unhide_cuda_env
+from sublocal.glossary import GlossaryError
 from sublocal.pipeline import backend_from_name, translate_file
 from sublocal.runtime import UnsupportedPythonError
+from sublocal.transcribe import transcribe_file
 
 NOT_IN_V01_EXTRACT = (
     "not in v0.1: extract existing subtitle tracks from video "
     "(ffmpeg/mkvextract). Soft subs only."
-)
-NOT_IN_V01_TRANSCRIBE = (
-    "not in v0.1: transcribe with faster-whisper, then translate "
-    "with the same pipeline."
 )
 
 
@@ -26,8 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sublocal",
         description=(
-            "Local-only subtitle translation. No cloud APIs, no API keys, "
-            "no telemetry."
+            "Local-only subtitle translation and transcription. "
+            "No cloud APIs, no API keys, no telemetry."
         ),
     )
     parser.add_argument(
@@ -60,6 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output path (default: input.<to>.<ext>)",
     )
     tr.add_argument(
+        "--glossary",
+        default=None,
+        metavar="PATH",
+        help="YAML map of source names to keep (e.g. examples/drama.yml)",
+    )
+    tr.add_argument(
+        "--model",
+        default="3.3b",
+        choices=("small", "3.3b", "large"),
+        help="NLLB size: 3.3b (default) or small (600M). large aliases 3.3b.",
+    )
+    tr.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
         default="auto",
@@ -86,22 +96,54 @@ def build_parser() -> argparse.ArgumentParser:
 
     transcribe = sub.add_parser(
         "transcribe",
-        help="Transcribe audio then translate (not in v0.1).",
+        help="Transcribe audio or video to source-language SRT.",
     )
-    transcribe.add_argument("args", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
+    transcribe.add_argument("input", help="Path to an audio or video file")
+    transcribe.add_argument(
+        "--language",
+        default=None,
+        metavar="LANG",
+        help="Whisper language code (e.g. ja). Detected if omitted.",
+    )
+    transcribe.add_argument(
+        "--glossary",
+        default=None,
+        metavar="PATH",
+        help="YAML names for Whisper prompt and JP canonical spelling",
+    )
+    transcribe.add_argument(
+        "--model",
+        default="large-v3",
+        help="Whisper model size (default: large-v3). Larger models are rejected.",
+    )
+    transcribe.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="Output SRT path (default: input with .srt suffix)",
+    )
+    transcribe.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="auto (default) uses CUDA when CTranslate2 sees a GPU; cuda requires a GPU",
+    )
 
     return parser
 
 
 def _cmd_translate(args: argparse.Namespace) -> int:
     try:
-        backend = backend_from_name(args.backend, args.device, args.batch_size)
+        backend = backend_from_name(
+            args.backend, args.device, args.batch_size, model=args.model
+        )
         out = translate_file(
             args.input,
             to_code=args.to,
             from_code=args.from_lang,
             output_path=args.out,
             backend=backend,
+            glossary=args.glossary,
         )
     except (
         FileNotFoundError,
@@ -111,6 +153,32 @@ def _cmd_translate(args: argparse.Namespace) -> int:
         UnsupportedFormatError,
         UnsupportedPythonError,
         CudaUnavailableError,
+        GlossaryError,
+        OSError,
+        RuntimeError,
+    ) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(out)
+    return 0
+
+
+def _cmd_transcribe(args: argparse.Namespace) -> int:
+    try:
+        out = transcribe_file(
+            args.input,
+            language=args.language,
+            model_size=args.model,
+            output_path=args.out,
+            device=args.device,
+            glossary=args.glossary,
+        )
+    except (
+        FileNotFoundError,
+        ValueError,
+        UnsupportedPythonError,
+        CudaUnavailableError,
+        GlossaryError,
         OSError,
         RuntimeError,
     ) as exc:
@@ -135,6 +203,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "extract":
         return _cmd_stub(NOT_IN_V01_EXTRACT)
     if args.command == "transcribe":
-        return _cmd_stub(NOT_IN_V01_TRANSCRIBE)
+        return _cmd_transcribe(args)
     parser.print_help()
     return 1
