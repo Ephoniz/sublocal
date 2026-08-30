@@ -7,6 +7,27 @@ from sublocal.formats.base import Block, Cue, Document, normalize_newlines
 TIMESTAMP_RE = re.compile(
     r"^\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}"
 )
+_TS_PART = re.compile(r"(\d{1,2}):(\d{2}):(\d{2})[,.](\d{1,3})")
+
+
+def parse_srt_seconds(timestamp: str) -> float:
+    """Parse an SRT/VTT clock (``00:00:01,400`` or ``00:00:01.400``) to seconds."""
+    match = _TS_PART.search(timestamp.strip())
+    if not match:
+        raise ValueError(f"Not an SRT timestamp: {timestamp!r}")
+    hours, minutes, secs, frac = (int(p) for p in match.groups())
+    if frac < 10:
+        frac *= 100
+    elif frac < 100:
+        frac *= 10
+    return hours * 3600 + minutes * 60 + secs + frac / 1000.0
+
+
+def split_timing(timing: str) -> tuple[float, float]:
+    if "-->" not in timing:
+        raise ValueError(f"Not an SRT timing line: {timing!r}")
+    left, right = timing.split("-->", 1)
+    return parse_srt_seconds(left), parse_srt_seconds(right)
 
 
 def parse_srt(content: str) -> Document:

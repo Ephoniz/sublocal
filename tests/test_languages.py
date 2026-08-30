@@ -6,6 +6,8 @@ from sublocal.languages import UnknownLanguageError, display_code, to_flores
 def test_short_codes() -> None:
     assert to_flores("en") == "eng_Latn"
     assert to_flores("es") == "spa_Latn"
+    assert to_flores("ja") == "jpn_Jpan"
+    assert to_flores("ko") == "kor_Hang"
     assert to_flores("zh-tw") == "zho_Hant"
     assert to_flores("pt-BR") == "por_Latn"
 

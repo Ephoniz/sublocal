@@ -2,7 +2,17 @@
 
 Local-only subtitle translation and transcription. No cloud APIs, no API keys, no telemetry.
 
-v0.3 transcribes audio or video to source-language SRT, and translates an existing subtitle file with NLLB-200 **3.3B** (timestamps stay as they were; only cue text is sent to the model). `transcribe` does not call `translate`.
+v0.4 is one command: transcribe mixed-language audio/video, stamp a language on each cue, unload Whisper, then NLLB-200 **3.3B** per cue.
+
+```bash
+sublocal clip.mp4 --to es
+```
+
+Writes `clip.es.srt` and a sidecar `clip.cues.jsonl` (`start`, `end`, `text`, `lang`). No `--language` required. Whisper `task=translate` is never the Spanish path.
+
+`--glossary` is opt-in. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese (or other non-Latin) cue are copied through and not sent to NLLB. **Kanji/kana names may still mangle.**
+
+`sublocal transcribe` and `sublocal translate in.srt --to es` stay as debug commands.
 
 ## Install
 
@@ -16,6 +26,12 @@ cd sublocal
 pip install .
 ```
 
+Short-cue Latin LID when ASR did not stamp lang (optional, local, no API). Package pin is `lingua-language-detector==1.4.2` (2.x needs Python 3.12; this project supports 3.11). Restricted to JA/EN/ES/KO:
+
+```bash
+pip install ".[lid]"
+```
+
 Dev / tests:
 
 ```bash
@@ -23,22 +39,44 @@ pip install -e ".[dev]"
 pytest
 ```
 
-## Translate
+## Product command
 
 ```bash
-sublocal translate input.srt --to es
+sublocal movie.mp4 --to es
+sublocal interview.wav --to es --out interview.es.srt
+sublocal clip.mkv --to es --language ja
+sublocal clip.mp4 --to es --model small
+sublocal clip.mp4 --to es --glossary examples/drama.yml
+sublocal clip.mp4 --to es --batch
+```
+
+`INPUT` is audio or video. `--to` is required. Optional: `--out`, `--device`, `--glossary`, `--model` (NLLB size), `--language` (mono ASR override), `--batch` (batched Whisper; `without_timestamps` is False).
+
+Default ASR is mixed-language: `language=None`, `multilingual=True`, `task=transcribe` (never `translate`), `condition_on_previous_text=False`, `without_timestamps=False`, Silero VAD ~500 ms, faster-whisper **large-v3**, word timestamps. Sequential multilingual is the default (fits a 12 GB card). `--language ja` is a mono override (`language='ja'`, `multilingual=False`) — no mixed LID. `--batch` is optional and still passes `without_timestamps=False` (the batched pipeline default is `True`, which drops timestamp tokens).
+
+After the source SRT would be written, Whisper is unloaded so it never shares VRAM with NLLB. Each cue is encoded with that cue's Whisper ISO → FLORES source (`ja`→`jpn_Jpan`, `en`→`eng_Latn`, `es`→`spa_Latn`). Cues already in `--to` are copied through.
+
+## Debug: transcribe / translate
+
+```bash
+sublocal transcribe movie.mp4
+sublocal transcribe movie.mp4 --language ja --out movie.srt
+sublocal translate movie.srt --to es
 sublocal translate input.srt --to es --from ja --glossary examples/drama.yml
-sublocal translate input.srt --to en --from es --out input.en.srt
 sublocal translate input.srt --to es --model small
 ```
 
-Default model is **NLLB-200 3.3B** through CTranslate2 on CUDA with float16. `--model small` is the distilled 600M. `--model large` is an alias for 3.3b.
+`transcribe` writes source-language SRT plus `INPUT.cues.jsonl`. `translate` reads that sidecar for per-cue lang when present; otherwise it uses a script heuristic (Hiragana/Katakana/CJK → ja, Hangul → ko, Latin → en) and lingua-py for short Latin cues if `[lid]` is installed.
 
-`--from` is optional; source language is detected from cue text when omitted.
+`extract` still prints `not in v0.1` and exits 2.
 
-`--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). The original Japanese sentence is sent to NLLB (バンコク stays inside バンコクに飛んだ). After MT, Latin names are overlaid and leftover particles next to those names are stripped. Do not inject Latin (Drum, Nozaki) or GLS / `<gN>` placeholders into the Japanese string — that is how ドラム became tambor and how cue 37 dropped both sentinels.
+## Translate details
 
-First-run 3.3B download is large (~6GB+) into the same Hugging Face cache as below. No Hugging Face token required.
+Default model is **NLLB-200 3.3B** through CTranslate2 on CUDA with float16 (`int8_float16` on CUDA OOM). `--model small` is the distilled 600M. `--model large` is an alias for 3.3b.
+
+`--from` is optional. `--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). It is never loaded unless you pass `--glossary`. The original Japanese sentence is sent to NLLB (バンコク stays inside バンコクに飛んだ). After MT, Latin names are overlaid and leftover particles next to those names are stripped.
+
+Latin/ASCII already in a non-Latin cue (`Drum`, `Nozaki`) is copied through and not sent to NLLB. Kanji/kana names without `--glossary` may still mangle.
 
 `--device auto` (the default) uses CUDA when `get_cuda_device_count()` is greater than 0 and prints `Using NVIDIA GeForce RTX 4070 Ti (cuda:0)` (or the real `nvidia-smi` name). Official CTranslate2 4.8 Windows wheels dynamically load CUDA 12 (`cublas64_12.dll`, `cudart64_12.dll`); a leftover `CUDA_VISIBLE_DEVICES=-1` or empty value is dropped in this process only. If the count is still 0, stderr prints why (`CUDA_PATH` unset or pointing at v13.x, missing `cublas64_12.dll` on PATH / `CUDA_PATH\bin`) and the run continues so a file still gets written. `--device cuda` exits 1 with the same diagnostic instead of faking CPU.
 
@@ -46,24 +84,15 @@ Progress goes to stderr: download (tqdm, extra), cache/load, `Model ready (devic
 
 `.srt` is the supported format. `.vtt` and `.ass` are best-effort: timings are kept, styling may not be perfect.
 
-## Transcribe
-
-```bash
-sublocal transcribe movie.mp4
-sublocal transcribe movie.mp4 --language ja --out movie.srt
-sublocal transcribe movie.mp4 --language ja --glossary examples/drama.yml
-sublocal transcribe movie.mp4 --model large-v3 --device auto
-```
-
-Writes source-language SRT only. There is no `--to`; run `translate` yourself on the SRT if you want another language. `extract` is still a stub and is not invoked. When using `--glossary` for Japanese, pass `--language ja`. Glossary keys are given to Whisper as `initial_prompt` (`condition_on_previous_text=False`); after ASR they are restored as the **Japanese** spellings, never Latin.
+## Transcribe details
 
 Default model is **faster-whisper large-v3** (`Systran/faster-whisper-large-v3`) on CUDA with float16 (int8 on CPU). Audio is decoded in-process with PyAV to 16 kHz mono and passed into Whisper as an array. `ffmpeg` is not required for `transcribe` (it is only for optional `extract` later). First run downloads ~3 GB into the same Hugging Face cache as translate if that snapshot is not already there.
 
-Cues are sentence-sized: word timestamps, Silero VAD at ~500 ms silence, then regroup (Japanese `。` / `？`, 0.5 s gaps — do not merge across ≥0.5 s — ~4 s duration cap, tiny-gap merge, ~32 characters / two lines). Timestamps are first-word start → last-word end, not Whisper's raw 30 s windows.
+Cues are sentence-sized: word timestamps, Silero VAD at ~500 ms silence, then regroup (Japanese `。` / `？`, 0.5 s gaps — do not merge across ≥0.5 s — ~4 s duration cap, tiny-gap merge, ~32 characters / two lines). Timestamps are first-word start → last-word end, not Whisper's raw 30 s windows. Cue length is capped at ~4 s.
 
-Progress on stderr is new flushed lines (`12/45s (26%) ~30s left`). The output path is the only stdout line. The Whisper model is unloaded after the SRT is written so a later `translate` in the same process can use the GPU.
+Progress on stderr is new flushed lines (`12/45s (26%) ~30s left`). The output path is the only stdout line. The Whisper model is unloaded after the SRT (and sidecar) are written so a later `translate` in the same process can use the GPU.
 
-`extract` still prints `not in v0.1` and exits 2.
+When using `--glossary` for Japanese, pass `--language ja`. Glossary keys are given to Whisper as `initial_prompt` (`condition_on_previous_text=False`); after ASR they are restored as the **Japanese** spellings, never Latin.
 
 ## Models
 
@@ -86,7 +115,8 @@ First-run downloads go into the user cache (no Hugging Face token):
 1. **Translate existing subtitle files** — v0.1.
 2. **Extract** soft subtitle tracks from video (`ffmpeg` / `mkvextract`). Not auto-chained. Still a stub.
 3. **Transcribe** audio/video to sentence-sized SRT — v0.2.
-4. **Translate default 3.3B + glossary** — this release.
-5. **Burned-in OCR** — later. Not faked.
+4. **Translate default 3.3B + glossary** — v0.3.
+5. **One-command mixed-language → target SRT** — this release.
+6. **Burned-in OCR** — later. Not faked.
 
 Helsinki-NLP Opus-MT (when a pair exists) may land later as a smaller per-pair option.
