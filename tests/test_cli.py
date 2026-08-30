@@ -75,7 +75,7 @@ def test_cli_passes_model_small_to_backend(
 
     seen: dict[str, str | None] = {}
 
-    def fake(name, device, batch_size, model=None):
+    def fake(name, device, batch_size, model=None, gguf=None, name_hint=False):
         seen["model"] = model
         return EchoBackend()
 
