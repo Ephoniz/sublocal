@@ -85,21 +85,23 @@ def test_create_translator_oom_retries_int8_float16(monkeypatch, capsys) -> None
 
 
 def test_ensure_loaded_unloads_whisper_before_translator(monkeypatch) -> None:
+    import types
+
     order: list[str] = []
 
     def unload(model=None):
         order.append("unload")
 
     monkeypatch.setattr("sublocal.transcribe.unload_whisper", unload)
-    monkeypatch.setattr(
-        "sublocal.backend._quiet_ct2_debug",
-        lambda: None,
-    )
-    monkeypatch.setattr(
-        "transformers.utils.logging.set_verbosity_error",
-        lambda: None,
-        raising=False,
-    )
+    monkeypatch.setattr("sublocal.backend._quiet_ct2_debug", lambda: None)
+    tf = types.ModuleType("transformers")
+    tf_utils = types.ModuleType("transformers.utils")
+    tf_logging = types.ModuleType("transformers.utils.logging")
+    tf_logging.set_verbosity_error = lambda: None
+    tf.utils = tf_utils
+    monkeypatch.setitem(sys.modules, "transformers", tf)
+    monkeypatch.setitem(sys.modules, "transformers.utils", tf_utils)
+    monkeypatch.setitem(sys.modules, "transformers.utils.logging", tf_logging)
     backend = NllbBackend(device="cpu")
     monkeypatch.setattr(backend, "_snapshot", lambda *a, **k: ("/tmp/m", True))
     monkeypatch.setattr(backend, "_load_tokenizer", lambda cache: (object(), True))
