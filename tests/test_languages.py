@@ -1,6 +1,12 @@
 import pytest
 
-from sublocal.languages import UnknownLanguageError, display_code, to_flores
+from sublocal.languages import (
+    GEMMAX_28_NAMES,
+    UnknownLanguageError,
+    display_code,
+    to_english_name,
+    to_flores,
+)
 
 
 def test_short_codes() -> None:
@@ -25,3 +31,17 @@ def test_unknown() -> None:
 def test_display_code() -> None:
     assert display_code("en") == "en"
     assert display_code("eng_Latn") == "eng"
+
+
+def test_english_names_from_iso_and_flores() -> None:
+    assert to_english_name("es") == "Spanish"
+    assert to_english_name("ja") == "Japanese"
+    assert to_english_name("en") == "English"
+    assert to_english_name("ko") == "Korean"
+    assert to_english_name("zh") == "Chinese"
+    assert to_english_name("fr") == "French"
+    assert to_english_name("jpn_Jpan") == "Japanese"
+    assert to_english_name("spa_Latn") == "Spanish"
+    assert to_english_name("Japanese") == "Japanese"
+    assert "Japanese" in GEMMAX_28_NAMES
+    assert len(GEMMAX_28_NAMES) == 28
