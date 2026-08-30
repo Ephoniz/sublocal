@@ -116,6 +116,29 @@ class Transcript:
                 if words:
                     out.append(Segment(words=words))
                 continue
+            if isinstance(seg, dict):
+                words_raw = seg.get("words")
+                if words_raw:
+                    words = [_as_word(w) for w in words_raw]
+                else:
+                    text = str(seg.get("text", "") or "")
+                    words = [
+                        Word(
+                            word=text,
+                            start=float(seg.get("start", 0.0) or 0.0),
+                            end=float(seg.get("end", 0.0) or 0.0),
+                        )
+                    ]
+                if words:
+                    out.append(
+                        Segment(
+                            words=words,
+                            start=_opt_float(seg.get("start")),
+                            end=_opt_float(seg.get("end")),
+                            lang=_as_lang(seg.get("lang") or seg.get("language")),
+                        )
+                    )
+                continue
             words_raw = getattr(seg, "words", None)
             if words_raw:
                 words = [_as_word(w) for w in words_raw]
@@ -506,37 +529,46 @@ def whisper_transcribe_kwargs(
     language: str | None,
     *,
     batched: bool = False,
+    per_chunk: bool = False,
     initial_prompt: str | None = None,
     condition_on_previous_text: bool | None = None,
 ) -> dict[str, Any]:
-    """Default faster-whisper kwargs. Never ``language=None`` without multilingual.
+    """faster-whisper kwargs for one call.
 
-    SYSTRAN/faster-whisper#869: ``language=None`` without ``multilingual=True``
-    detects language once on the first 30s and locks it for the file.
+    Mixed product path: one call **per VAD slice** with ``per_chunk=True``
+    (``language=None``, ``multilingual=False``). First-30s LID then applies
+    only to that slice. Do not pass ``language=None`` on concatenated audio
+    (faster-whisper#869 locks the file to the first window).
+
+    ``--language ja``: one full-file call, ``multilingual=False``.
     """
     kwargs: dict[str, Any] = {
         "word_timestamps": True,
-        "verbose": None,
-        "regroup": False,
-        "vad_filter": True,
-        "vad_parameters": dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS),
-        # Silence-adjust uses this same ndarray (no ffmpeg reload).
-        "vad": True,
-        "min_silence_dur": VAD_MIN_SILENCE_S,
         "task": "transcribe",
         "condition_on_previous_text": (
             False if condition_on_previous_text is None else condition_on_previous_text
         ),
-        # Sequential default is False; batched default is True and drops
-        # timestamp tokens (whole-chunk SRT spans). Always keep timestamps.
         "without_timestamps": False,
     }
     if language:
         kwargs["language"] = language
         kwargs["multilingual"] = False
-    else:
+        kwargs["verbose"] = None
+        kwargs["regroup"] = False
+        kwargs["vad_filter"] = True
+        kwargs["vad_parameters"] = dict(min_silence_duration_ms=VAD_MIN_SILENCE_MS)
+        kwargs["vad"] = True
+        kwargs["min_silence_dur"] = VAD_MIN_SILENCE_S
+    elif per_chunk:
         kwargs["language"] = None
-        kwargs["multilingual"] = True
+        kwargs["multilingual"] = False
+        kwargs["vad_filter"] = False
+    else:
+        raise ValueError(
+            "language=None on the full file is not supported. "
+            "The mixed product path transcribes each VAD slice separately "
+            "(per_chunk=True)."
+        )
     if initial_prompt is not None:
         kwargs["initial_prompt"] = initial_prompt
     return kwargs
@@ -607,6 +639,66 @@ def lang_from_prompt_token(token: Any) -> str | None:
     return None
 
 
+def speech_timestamps(
+    audio: Any, sampling_rate: int = WHISPER_SAMPLE_RATE
+) -> list[dict[str, int]]:
+    """Silero VAD speech spans in samples. Empty slices are not glued."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    opts = VadOptions(
+        threshold=0.5,
+        min_silence_duration_ms=VAD_MIN_SILENCE_MS,
+    )
+    return list(get_speech_timestamps(audio, opts, sampling_rate=sampling_rate))
+
+
+def vad_audio_slices(
+    audio: Any, sampling_rate: int = WHISPER_SAMPLE_RATE
+) -> list[dict[str, Any]]:
+    """One waveform per Silero speech chunk. Skip empty; do not concatenate."""
+    slices: list[dict[str, Any]] = []
+    for chunk in speech_timestamps(audio, sampling_rate=sampling_rate):
+        start = int(chunk.get("start", 0) or 0)
+        end = int(chunk.get("end", 0) or 0)
+        if end <= start:
+            continue
+        wave = audio[start:end]
+        if getattr(wave, "size", len(wave)) == 0:
+            continue
+        slices.append(
+            {
+                "start_s": start / sampling_rate,
+                "end_s": end / sampling_rate,
+                "audio": wave,
+            }
+        )
+    return slices
+
+
+def require_fw_model(model: Any) -> Any:
+    """The raw faster-whisper ``WhisperModel``, not the stable-ts wrapper."""
+    fw = _find_fw_model(model)
+    if fw is None:
+        raise RuntimeError(
+            "Could not find faster-whisper WhisperModel under the loaded "
+            "transcriber. Mixed-language ASR needs WhisperModel.transcribe "
+            "(or transcribe_original) on each VAD slice."
+        )
+    return fw
+
+
+def fill_missing_cue_langs(doc: Document) -> None:
+    """Script / lingua LID for cues Whisper did not stamp. Never write null."""
+    from sublocal.lid import detect_cue_lang
+
+    for cue in doc.cues:
+        if cue.extra.get("lang"):
+            continue
+        lang = detect_cue_lang(cue.text)
+        if lang:
+            cue.extra["lang"] = lang
+
+
 def _whisper_infer(
     model: Any,
     audio: Any,
@@ -617,12 +709,41 @@ def _whisper_infer(
     condition_on_previous_text: bool | None = None,
     batched: bool = False,
 ) -> Any:
-    """Run stable-ts/faster-whisper on an in-memory waveform.
+    """Run Whisper on an in-memory 16 kHz mono float32 array (never a path).
 
-    ``audio`` must be a 16 kHz mono float32 array, never a file path.
-    Passing a path makes ``WhisperResult.adjust_by_silence`` reload the
-    file through ``load_audio`` → ``ffmpeg``, which is not on PATH.
+    Mixed default: Silero slices → one ``WhisperModel.transcribe`` per slice.
+    ``--language``: one full-file call (v0.3 mono path).
     """
+    if language:
+        return _mono_infer(
+            model,
+            audio,
+            language,
+            progress_cb,
+            initial_prompt=initial_prompt,
+            condition_on_previous_text=condition_on_previous_text,
+            batched=batched,
+        )
+    return _per_vad_chunk_infer(
+        model,
+        audio,
+        progress_cb,
+        initial_prompt=initial_prompt,
+        condition_on_previous_text=condition_on_previous_text,
+        batched=batched,
+    )
+
+
+def _mono_infer(
+    model: Any,
+    audio: Any,
+    language: str,
+    progress_cb: Callable[[float, float], None],
+    *,
+    initial_prompt: str | None,
+    condition_on_previous_text: bool | None,
+    batched: bool,
+) -> Any:
     kwargs = whisper_transcribe_kwargs(
         language,
         batched=batched,
@@ -630,54 +751,133 @@ def _whisper_infer(
         condition_on_previous_text=condition_on_previous_text,
     )
     kwargs["progress_callback"] = progress_cb
-    hook = _LangRecorder()
-    unhook = _try_install_lang_hooks(model, hook, batched=batched)
-    try:
-        result = _call_transcribe(model, audio, kwargs, batched=batched, hook=hook)
-        result = _apply_stamped_langs(result, hook, language)
+    result = _call_model_transcribe(model, audio, kwargs, batched=batched)
+    segs = _result_segments(result)
+    if segs:
+        for seg in segs:
+            if _segment_lang(seg) is None:
+                _set_seg_lang(seg, language)
         return result
-    finally:
-        unhook()
+    return result
 
 
-def _call_transcribe(
+def _per_vad_chunk_infer(
     model: Any,
     audio: Any,
-    kwargs: dict[str, Any],
+    progress_cb: Callable[[float, float], None],
     *,
+    initial_prompt: str | None,
+    condition_on_previous_text: bool | None,
     batched: bool,
-    hook: _LangRecorder | None = None,
+) -> Transcript:
+    fw = require_fw_model(model)
+    slices = vad_audio_slices(audio)
+    raw_dur = float(getattr(audio, "shape", [0])[0]) / WHISPER_SAMPLE_RATE
+    if raw_dur <= 0:
+        raw_dur = float(len(audio)) / WHISPER_SAMPLE_RATE
+    kept = sum(sl["end_s"] - sl["start_s"] for sl in slices)
+    status(
+        f"VAD kept {kept:.2f}s of {raw_dur:.2f}s "
+        f"({len(slices)} slices, threshold=0.5)"
+    )
+    kwargs = whisper_transcribe_kwargs(
+        None,
+        batched=batched,
+        per_chunk=True,
+        initial_prompt=initial_prompt,
+        condition_on_previous_text=condition_on_previous_text,
+    )
+    method = _raw_fw_transcribe(fw, batched=batched)
+    collected: list[Segment] = []
+    for sl in slices:
+        segs, info = _invoke_fw_transcribe(method, sl["audio"], kwargs)
+        lang = getattr(info, "language", None) if info is not None else None
+        collected.extend(_segments_from_chunk(segs, sl["start_s"], lang))
+        progress_cb(sl["end_s"], raw_dur)
+    if not slices:
+        progress_cb(raw_dur, raw_dur)
+    return Transcript(collected)
+
+
+def _raw_fw_transcribe(fw: Any, *, batched: bool) -> Callable[..., Any]:
+    if batched:
+        pipe = getattr(fw, "batch_inference_pipeline", None)
+        if pipe is None:
+            from faster_whisper import BatchedInferencePipeline
+
+            pipe = BatchedInferencePipeline(model=fw)
+        transcribe = getattr(pipe, "transcribe", None)
+        if not callable(transcribe):
+            raise RuntimeError(
+                "Could not find BatchedInferencePipeline.transcribe."
+            )
+        return transcribe
+    orig = getattr(fw, "transcribe_original", None)
+    if callable(orig):
+        return orig
+    transcribe = getattr(fw, "transcribe", None)
+    if not callable(transcribe):
+        raise RuntimeError(
+            "Could not find WhisperModel.transcribe / transcribe_original."
+        )
+    return transcribe
+
+
+def _invoke_fw_transcribe(
+    method: Callable[..., Any], audio: Any, kwargs: dict[str, Any]
+) -> tuple[list[Any], Any]:
+    fw_kwargs = {
+        k: v
+        for k, v in kwargs.items()
+        if k
+        in {
+            "language",
+            "multilingual",
+            "task",
+            "condition_on_previous_text",
+            "word_timestamps",
+            "without_timestamps",
+            "vad_filter",
+            "initial_prompt",
+        }
+    }
+    try:
+        out = method(audio, **fw_kwargs)
+    except TypeError:
+        out = method(audio, **kwargs)
+    if isinstance(out, tuple) and len(out) == 2:
+        segs, info = out
+        return list(segs), info
+    return _result_segments(out), getattr(out, "info", None)
+
+
+def _segments_from_chunk(
+    fw_segs: list[Any], offset: float, lang: str | None
+) -> list[Segment]:
+    holder = type("_Hold", (), {"segments": fw_segs})()
+    tr = Transcript.from_any(holder)
+    for seg in tr.segments:
+        for word in seg.words:
+            word.start = float(word.start) + offset
+            word.end = float(word.end) + offset
+        if seg.start is not None:
+            seg.start = float(seg.start) + offset
+        if seg.end is not None:
+            seg.end = float(seg.end) + offset
+        if not seg.lang:
+            seg.lang = lang
+    return tr.segments
+
+
+def _call_model_transcribe(
+    model: Any, audio: Any, kwargs: dict[str, Any], *, batched: bool
 ) -> Any:
     if batched:
         fw = _find_fw_model(model)
         if fw is not None:
-            from faster_whisper import BatchedInferencePipeline
-
-            pipe = BatchedInferencePipeline(model=fw)
-            orig_gen = getattr(pipe, "generate_segment_batched", None)
-            if callable(orig_gen) and hook is not None:
-
-                def _gen(features, tokenizer, chunks_metadata, options, *a, **k):
-                    hook.chunks_metadata.extend(list(chunks_metadata or []))
-                    return orig_gen(
-                        features, tokenizer, chunks_metadata, options, *a, **k
-                    )
-
-                pipe.generate_segment_batched = _gen  # type: ignore[method-assign]
-            batch_kwargs = {
-                k: v
-                for k, v in kwargs.items()
-                if k
-                not in {
-                    "progress_callback",
-                    "verbose",
-                    "regroup",
-                    "vad",
-                    "min_silence_dur",
-                }
-            }
-            segs, _info = pipe.transcribe(audio, **batch_kwargs)
-            return list(segs)
+            method = _raw_fw_transcribe(fw, batched=True)
+            segs, info = _invoke_fw_transcribe(method, audio, kwargs)
+            return type("_FW", (), {"segments": segs, "info": info})()
     transcribe = model.transcribe
     try:
         return transcribe(audio, **kwargs)
@@ -694,115 +894,12 @@ def _call_transcribe(
                 "progress_callback",
             }
         }
-        # Never drop multilingual while language is None (faster-whisper#869).
-        if fallback.get("language") is None:
-            fallback["multilingual"] = True
         fallback["progress_callback"] = kwargs.get("progress_callback")
         try:
             return transcribe(audio, **fallback)
         except TypeError:
             fallback.pop("progress_callback", None)
-            if fallback.get("language") is None:
-                fallback["multilingual"] = True
             return transcribe(audio, **fallback)
-
-
-def _apply_stamped_langs(result: Any, hook: "_LangRecorder", language: str | None) -> Any:
-    segs = _result_segments(result)
-    if not segs:
-        return result
-    if hook.per_segment:
-        for i, seg in enumerate(segs):
-            lang = hook.per_segment[i] if i < len(hook.per_segment) else hook.current
-            if _segment_lang(seg) is None:
-                _set_seg_lang(seg, lang)
-    elif hook.batch_langs and hook.chunks_metadata:
-        stamp_langs_from_vad_chunks(segs, hook.chunks_metadata, hook.batch_langs)
-    elif hook.batch_langs:
-        stamp_langs_batched(segs, hook.batch_langs)
-    elif language:
-        for seg in segs:
-            if _segment_lang(seg) is None:
-                _set_seg_lang(seg, language)
-    return result
-
-
-class _LangRecorder:
-    def __init__(self) -> None:
-        self.current: str | None = None
-        self.per_segment: list[str | None] = []
-        self.batch_langs: list[str | None] = []
-        self.chunks_metadata: list[dict[str, Any]] = []
-
-
-def _try_install_lang_hooks(
-    model: Any, hook: _LangRecorder, *, batched: bool
-) -> Callable[[], None]:
-    restorers: list[Callable[[], None]] = []
-
-    try:
-        from faster_whisper.tokenizer import Tokenizer
-    except ImportError:
-        Tokenizer = None  # type: ignore[misc, assignment]
-    if Tokenizer is not None:
-        orig_sa = Tokenizer.__setattr__
-
-        def watched(self: Any, name: str, value: Any) -> None:
-            orig_sa(self, name, value)
-            if name == "language_code":
-                hook.current = value
-
-        Tokenizer.__setattr__ = watched  # type: ignore[method-assign]
-        restorers.append(lambda: setattr(Tokenizer, "__setattr__", orig_sa))
-
-    fw = _find_fw_model(model)
-    if fw is not None and hasattr(fw, "transcribe"):
-        orig = fw.transcribe
-
-        def wrapped(*args: Any, **kw: Any) -> Any:
-            out = orig(*args, **kw)
-            if isinstance(out, tuple) and len(out) == 2:
-                segs, info = out
-
-                def gen() -> Any:
-                    for seg in segs:
-                        lang = hook.current
-                        hook.per_segment.append(lang)
-                        _set_seg_lang(seg, lang)
-                        yield seg
-
-                return gen(), info
-            return out
-
-        fw.transcribe = wrapped
-        restorers.append(lambda: setattr(fw, "transcribe", orig))
-
-    if batched and fw is not None:
-        ct2 = getattr(fw, "model", None)
-        detect = getattr(ct2, "detect_language", None) if ct2 is not None else None
-        if callable(detect):
-
-            def wrapped_detect(*args: Any, **kw: Any) -> Any:
-                results = detect(*args, **kw)
-                try:
-                    for item in results:
-                        tok = item[0][0]
-                        hook.batch_langs.append(lang_from_prompt_token(tok))
-                except Exception:
-                    pass
-                return results
-
-            ct2.detect_language = wrapped_detect
-            restorers.append(lambda: setattr(ct2, "detect_language", detect))
-
-    def unhook() -> None:
-        for restore in reversed(restorers):
-            try:
-                restore()
-            except Exception:
-                pass
-
-    return unhook
 
 
 def _find_fw_model(model: Any) -> Any | None:
@@ -846,9 +943,18 @@ def _result_segments(result: Any) -> list[Any]:
         return []
 
 
+def _as_lang(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _segment_lang(seg: Any) -> str | None:
     if isinstance(seg, Segment):
         return seg.lang
+    if isinstance(seg, dict):
+        return _as_lang(seg.get("lang") or seg.get("language"))
     for attr in ("lang", "language"):
         value = getattr(seg, attr, None)
         if value:
@@ -914,6 +1020,7 @@ def transcribe_document(
         doc = transcript_to_document(transcript)
         if gloss is not None:
             canonicalize_document(doc, gloss)
+        fill_missing_cue_langs(doc)
         return doc
     finally:
         unload_whisper(model)

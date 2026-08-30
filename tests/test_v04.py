@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from sublocal.backend import EchoBackend
 from sublocal.cli import is_product_argv, main, parse_product_args
 from sublocal.cues_jsonl import cues_jsonl_path, read_cues_jsonl, write_cues_jsonl
@@ -43,16 +45,21 @@ def _srt(tmp: Path, name: str, cues: list[tuple[str, str]]) -> Path:
     return path
 
 
-def test_multilingual_true_when_language_none() -> None:
-    kw = whisper_transcribe_kwargs(None)
+def test_per_chunk_kwargs_are_not_multilingual_true() -> None:
+    kw = whisper_transcribe_kwargs(None, per_chunk=True)
     assert kw["language"] is None
-    assert kw["multilingual"] is True
+    assert kw["multilingual"] is False
     assert kw["task"] == "transcribe"
     assert kw["task"] != "translate"
     assert kw["condition_on_previous_text"] is False
-    assert kw["vad_filter"] is True
+    assert kw["vad_filter"] is False
     assert kw["word_timestamps"] is True
     assert kw["without_timestamps"] is False
+
+
+def test_full_file_language_none_is_rejected() -> None:
+    with pytest.raises(ValueError, match="VAD slice"):
+        whisper_transcribe_kwargs(None)
 
 
 def test_multilingual_false_when_language_ja() -> None:
@@ -63,38 +70,141 @@ def test_multilingual_false_when_language_ja() -> None:
     assert kw["without_timestamps"] is False
 
 
-def test_whisper_infer_passes_multilingual_when_language_none() -> None:
-    seen: dict = {}
+def test_whisper_infer_mono_ja_one_call() -> None:
+    seen: list[dict] = []
 
     class Model:
         def transcribe(self, audio, **kwargs):
-            seen.update(kwargs)
-            return Transcript([])
-
-    _whisper_infer(Model(), object(), None, lambda *_a: None)
-    assert seen["language"] is None
-    assert seen["multilingual"] is True
-    assert seen["task"] == "transcribe"
-    assert seen["without_timestamps"] is False
-
-
-def test_whisper_infer_mono_ja_omits_mixed_lid() -> None:
-    seen: dict = {}
-
-    class Model:
-        def transcribe(self, audio, **kwargs):
-            seen.update(kwargs)
+            seen.append(kwargs)
             return Transcript([])
 
     _whisper_infer(Model(), object(), "ja", lambda *_a: None)
-    assert seen["language"] == "ja"
-    assert seen.get("multilingual") is False
+    assert len(seen) == 1
+    assert seen[0]["language"] == "ja"
+    assert seen[0].get("multilingual") is False
+    assert seen[0]["task"] == "transcribe"
 
 
 def test_batch_still_sets_without_timestamps_false() -> None:
-    kw = whisper_transcribe_kwargs(None, batched=True)
+    kw = whisper_transcribe_kwargs(None, per_chunk=True, batched=True)
     assert kw["without_timestamps"] is False
-    assert kw["multilingual"] is True
+    assert kw["multilingual"] is False
+
+
+def test_mixed_path_transcribes_each_vad_slice_not_concatenated(monkeypatch) -> None:
+    np = pytest.importorskip("numpy")
+    sr = 16000
+    wave = np.zeros(sr * 20, dtype=np.float32)
+    monkeypatch.setattr(
+        "sublocal.transcribe.speech_timestamps",
+        lambda audio, sampling_rate=sr: [
+            {"start": 0, "end": 12 * sr},
+            {"start": 13 * sr, "end": int(19.5 * sr)},
+        ],
+    )
+    calls: list[tuple[int, dict]] = []
+
+    class WhisperModel:
+        def transcribe(self, audio, **kwargs):
+            calls.append((len(audio), dict(kwargs)))
+            lang = "ja" if len(calls) == 1 else "en"
+            text = "こんにちは" if lang == "ja" else "hello"
+            seg = Segment(words=[Word(text, 0.1, 1.0)], start=0.1, end=1.0)
+            info = type("Info", (), {"language": lang})()
+            return [seg], info
+
+    _whisper_infer(WhisperModel(), wave, None, lambda *_a: None)
+    assert len(calls) == 2
+    assert calls[0][0] == 12 * sr
+    assert calls[1][0] == int(19.5 * sr) - 13 * sr
+    assert calls[0][0] + calls[1][0] < len(wave)
+    for _n, kw in calls:
+        assert kw["language"] is None
+        assert kw["multilingual"] is False
+        assert kw["task"] == "transcribe"
+        assert kw["without_timestamps"] is False
+        assert kw.get("vad_filter") is False
+
+
+def test_chunk_info_language_and_time_offset(monkeypatch) -> None:
+    np = pytest.importorskip("numpy")
+    sr = 16000
+    wave = np.zeros(sr * 20, dtype=np.float32)
+    monkeypatch.setattr(
+        "sublocal.transcribe.speech_timestamps",
+        lambda audio, sampling_rate=sr: [
+            {"start": 0, "end": 12 * sr},
+            {"start": 13 * sr, "end": int(19.5 * sr)},
+        ],
+    )
+
+    class WhisperModel:
+        n = 0
+
+        def transcribe(self, audio, **kwargs):
+            WhisperModel.n += 1
+            lang = "ja" if WhisperModel.n == 1 else "en"
+            text = "坂の中" if lang == "ja" else "hello there"
+            seg = Segment(words=[Word(text, 0.50, 1.40)], start=0.50, end=1.40)
+            return [seg], type("Info", (), {"language": lang})()
+
+    result = _whisper_infer(WhisperModel(), wave, None, lambda *_a: None)
+    assert isinstance(result, Transcript)
+    langs = [s.lang for s in result.segments]
+    assert langs == ["ja", "en"]
+    assert result.segments[0].words[0].start == pytest.approx(0.50)
+    assert result.segments[1].words[0].start == pytest.approx(13.50)
+    assert result.segments[1].words[0].end == pytest.approx(14.40)
+
+
+def test_jsonl_fills_null_lang_from_script_heuristic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    dummy = tmp_path / "clip.mp4"
+    dummy.write_bytes(b"fake-media")
+    monkeypatch.setattr("sublocal.device.cuda_device_count", lambda: 1)
+    monkeypatch.setattr("sublocal.device.cuda_device_name", lambda index=0: "Fake GPU")
+    monkeypatch.setattr("sublocal.transcribe.load_whisper", lambda *a, **k: object())
+    monkeypatch.setattr("sublocal.transcribe.decode_audio", lambda path: object())
+
+    def fake_infer(model, audio, language, progress_cb, **kwargs):
+        progress_cb(1.0, 1.0)
+        return Transcript(
+            [
+                Segment(words=[Word("こんにちは。", 0.5, 1.4)], start=0.5, end=1.4),
+                Segment(
+                    words=[Word("Good morning to all of my friends.", 13.0, 14.0)],
+                    start=13.0,
+                    end=14.0,
+                ),
+            ]
+        )
+
+    monkeypatch.setattr("sublocal.transcribe._whisper_infer", fake_infer)
+    transcribe_file(dummy, output_path=tmp_path / "clip.srt")
+    rows = read_cues_jsonl(cues_jsonl_path(tmp_path / "clip.srt"))
+    assert [r["lang"] for r in rows] == ["ja", "en"]
+    assert all(r["lang"] is not None for r in rows)
+
+
+def test_from_any_copies_lang_from_fw_like_object() -> None:
+    class FWSeg:
+        def __init__(self) -> None:
+            self.words = [Word("hello", 0.0, 1.0)]
+            self.start = 0.0
+            self.end = 1.0
+            self.lang = "en"
+
+    tr = Transcript.from_any(type("R", (), {"segments": [FWSeg()]})())
+    assert tr.segments[0].lang == "en"
+    tr2 = Transcript.from_any(
+        type(
+            "R",
+            (),
+            {"segments": [{"text": "こんにちは", "start": 0.0, "end": 1.0, "lang": "ja"}]},
+        )()
+    )
+    assert tr2.segments[0].lang == "ja"
 
 
 def test_stamp_lang_when_tokenizer_language_code_changes() -> None:

@@ -54,7 +54,7 @@ sublocal clip.mp4 --to es --batch
 
 `INPUT` is audio or video. `--to` is required. Optional: `--out`, `--device`, `--glossary`, `--model` (NLLB size), `--language` (mono ASR override), `--batch` (batched Whisper; `without_timestamps` is False).
 
-Default ASR is mixed-language: `language=None`, `multilingual=True`, `task=transcribe` (never `translate`), `condition_on_previous_text=False`, `without_timestamps=False`, Silero VAD ~500 ms, faster-whisper **large-v3**, word timestamps. Sequential multilingual is the default (fits a 12 GB card). `--language ja` is a mono override (`language='ja'`, `multilingual=False`) — no mixed LID. `--batch` is optional and still passes `without_timestamps=False` (the batched pipeline default is `True`, which drops timestamp tokens).
+Default ASR iterates Silero speech timestamps and calls faster-whisper **once per slice** (`language=None`, `multilingual=False`, `task=transcribe`, `without_timestamps=False`). That is first-30s LID on that chunk only — mixed JA+EN is not glued into one 30s window. Sequential, one slice at a time (fits a 12 GB card). `--language ja` is a mono override: one full-file call, `multilingual=False`. `--batch` is optional and still passes `without_timestamps=False`.
 
 After the source SRT would be written, Whisper is unloaded so it never shares VRAM with NLLB. Each cue is encoded with that cue's Whisper ISO → FLORES source (`ja`→`jpn_Jpan`, `en`→`eng_Latn`, `es`→`spa_Latn`). Cues already in `--to` are copied through.
 
