@@ -39,11 +39,21 @@ class FakeLlama:
     def __init__(self) -> None:
         self.prompts: list[str] = []
         self.kwargs: list[dict] = []
+        self.chat_calls: list[object] = []
 
-    def __call__(self, prompt, **kwargs):
+    def create_completion(self, prompt=None, **kwargs):
         self.prompts.append(prompt)
         self.kwargs.append(kwargs)
-        return {"choices": [{"text": "Hola"}]}
+        sentinels = __import__("re").findall(r"xx\d+xx", prompt or "")
+        text = "Hola " + " ".join(sentinels) if sentinels else "Hola"
+        return {"choices": [{"text": text, "finish_reason": "stop"}]}
+
+    def __call__(self, prompt=None, **kwargs):
+        return self.create_completion(prompt=prompt, **kwargs)
+
+    def create_chat_completion(self, *args, **kwargs):
+        self.chat_calls.append((args, kwargs))
+        raise AssertionError("create_chat_completion must not be used")
 
 
 def test_product_and_translate_still_parse() -> None:
@@ -124,7 +134,7 @@ def test_latin_copy_through_protects_liu_zhang_before_model(tmp_path: Path) -> N
     src = _srt(
         tmp_path,
         "names.srt",
-        [("00:00:00,000 --> 00:00:02,000", "LiuとZhangです")],
+            [("00:00:00,000 --> 00:00:02,000", "LiuとZhangが飛んだ")],
     )
     llama = FakeLlama()
     backend = GemmaXBackend(device="cpu")

@@ -148,18 +148,22 @@ def test_create_llama_oom_retries_n_ctx_1024(monkeypatch, capsys) -> None:
     calls: list[int] = []
 
     class FakeLlama:
-        def __init__(self, model_path, n_gpu_layers, n_ctx, logits_all):
+        def __init__(self, model_path, n_gpu_layers, n_ctx, logits_all, **kwargs):
             calls.append(n_ctx)
             assert n_gpu_layers == -1
             assert logits_all is False
+            self.chat_format = "gemma"
+            self.chat_handler = object()
             if n_ctx == 2048:
                 raise RuntimeError("CUDA out of memory")
 
     monkeypatch.setitem(
         sys.modules, "llama_cpp", SimpleNamespace(Llama=FakeLlama)
     )
-    _create_llama("/tmp/fake.gguf", n_ctx=2048)
+    llama = _create_llama("/tmp/fake.gguf", n_ctx=2048)
     assert calls == [2048, 1024]
+    assert llama.chat_format is None
+    assert llama.chat_handler is None
     err = capsys.readouterr().err
     assert "1024" in err
 

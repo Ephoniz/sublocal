@@ -10,13 +10,16 @@ from sublocal.backend import (
     GemmaXBackend,
     NllbBackend,
     TranslatorBackend,
+    leftover_arrow_count,
 )
 from sublocal.cues_jsonl import cues_jsonl_path, langs_from_sidecar, write_cues_jsonl
 from sublocal.detect import DetectionError, detect_iso639
-from sublocal.formats import dumps, load, save
+from sublocal.extract import extract_file_glossary, merge_mappings, pykakasi_version
+from sublocal.formats import load, save
 from sublocal.formats.base import Cue, Document
 from sublocal.glossary import (
     Glossary,
+    GlossaryError,
     as_glossary,
     has_cjk,
     needs_nllb,
@@ -107,8 +110,8 @@ def translate_document(
     """Translate cue text in-place. Returns (doc, src_flores, tgt_flores).
 
     Each cue is encoded with that cue's source language. Cues already in
-    ``to_code`` are copied through. Latin/ASCII tokens in non-Latin cues
-    are not sent through the MT backend.
+    ``to_code`` are copied through. File-local GiNZA/speaker/Latin names
+    are ``xxNxx``-protected before MT; Latin is restored after.
     """
     cues = doc.cues
     if not cues:
@@ -118,14 +121,21 @@ def translate_document(
     tgt = to_flores(to_code)
     if backend is None:
         backend = GemmaXBackend()
-    gloss = as_glossary(glossary)
+    yaml_gloss = as_glossary(glossary)
     texts = [c.text for c in cues]
+    file_map, ginza_count = extract_file_glossary(texts, langs, load=True)
+    yaml_map = dict(yaml_gloss.mapping) if yaml_gloss is not None else {}
+    merged = merge_mappings(file_map, yaml_map)
+    gloss = Glossary(merged) if merged else None
+    status(f"GiNZA entities {ginza_count} (pykakasi {pykakasi_version()})")
+
     translated: list[str | None] = [None] * len(texts)
     # src_flores → list of cue indices to send
     groups: dict[str, list[int]] = {}
-    source_by_i: list[str] = [""] * len(texts)
+    pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
     latin_by_i: list[list[str]] = [[] for _ in texts]
     speaker_prefix: list[str | None] = [None] * len(texts)
+    protect_count = 0
 
     for i, text in enumerate(texts):
         src_iso = langs[i]
@@ -143,17 +153,22 @@ def translate_document(
                     continue
                 work = rest
             guarded, pairs = gloss.protect(work)
+            protect_count += len(pairs)
             if pairs and not needs_nllb(guarded):
                 restored = gloss.restore(guarded, pairs, target="value")
                 body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
                 translated[i] = _with_speaker(speaker_prefix[i], body)
                 continue
-        source_by_i[i] = work
-        send = work
-        if not is_latin_script(src):
-            send, latin_by_i[i] = protect_latin_names(work)
+            pairs_by_i[i] = pairs
+            send = guarded
+        else:
+            send = work
+            if not is_latin_script(src):
+                send, latin_by_i[i] = protect_latin_names(work)
         groups.setdefault(src, []).append(i)
-        texts[i] = send  # what we actually send
+        texts[i] = send
+
+    status(f"Protected {protect_count} sentinels")
 
     send_count = sum(len(idx) for idx in groups.values())
     prepare = getattr(backend, "prepare", None)
@@ -161,7 +176,9 @@ def translate_document(
         prepare()
 
     if not groups:
-        apply_translations(doc, [t if t is not None else "" for t in translated])
+        finals = [t if t is not None else "" for t in translated]
+        apply_translations(doc, finals)
+        _log_mt_stats(backend, finals, elapsed=None)
         src_display = to_flores(langs[0]) if langs else tgt
         return doc, src_display, tgt
 
@@ -184,20 +201,65 @@ def translate_document(
             mt = batch[j]
             if latin_by_i[i]:
                 mt = restore_latin_names(mt, latin_by_i[i])
-            if gloss is not None:
-                source = source_by_i[i]
-                body = gloss.overlay_names(source, mt)
-                latins = [v for k, v in gloss.entries if k in source]
+            body = mt
+            if gloss is not None and pairs_by_i[i]:
+                body = _restore_or_retry(
+                    gloss, mt, pairs_by_i[i], backend, texts[i], src, tgt, cue_index=i
+                )
+                latins = [v for _, v in pairs_by_i[i]]
                 if latins:
                     body = gloss.cleanup_adjacent(body, latins)
-                translated[i] = _with_speaker(speaker_prefix[i], body)
-            else:
-                translated[i] = mt
-    status(f"MT pass {time.monotonic() - started:.1f}s")
-
-    apply_translations(doc, [t if t is not None else "" for t in translated])
+            translated[i] = _with_speaker(speaker_prefix[i], body)
+    elapsed = time.monotonic() - started
+    finals = [t if t is not None else "" for t in translated]
+    apply_translations(doc, finals)
+    _log_mt_stats(backend, finals, elapsed=elapsed)
     first_src = to_flores(langs[0]) if langs else tgt
     return doc, first_src, tgt
+
+
+def _restore_or_retry(
+    gloss: Glossary,
+    mt: str,
+    pairs: list[tuple[str, str]],
+    backend: TranslatorBackend,
+    send: str,
+    src: str,
+    tgt: str,
+    *,
+    cue_index: int,
+) -> str:
+    """Restore xxNxx. Retry the cue once, then fail loud."""
+    try:
+        return gloss.restore(mt, pairs, target="value")
+    except GlossaryError:
+        retry = backend.translate([send], src, tgt)
+        if not retry:
+            raise GlossaryError(
+                f"Cue {cue_index + 1}: glossary sentinel missing after translation"
+            ) from None
+        try:
+            return gloss.restore(retry[0], pairs, target="value")
+        except GlossaryError as exc:
+            raise GlossaryError(f"Cue {cue_index + 1}: {exc}") from exc
+
+
+def _log_mt_stats(
+    backend: object,
+    texts: list[str],
+    *,
+    elapsed: float | None,
+) -> None:
+    counts = getattr(backend, "finish_reason_counts", None)
+    if counts:
+        status(
+            f"finish_reason stop={counts.get('stop', 0)} "
+            f"length={counts.get('length', 0)}"
+        )
+    arrows = sum(leftover_arrow_count(text) for text in texts)
+    status(f"leftover arrows {arrows}")
+    if elapsed is not None:
+        status(f"MT pass {elapsed:.1f}s")
 
 
 def _with_speaker(prefix: str | None, body: str) -> str:

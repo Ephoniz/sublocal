@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sublocal"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local-only subtitle translation and transcription. No cloud APIs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,7 @@ dependencies = [
   "huggingface-hub>=0.23.0",
   "langdetect>=1.0.9",
   "llama-cpp-python==0.3.4",
+  "pykakasi>=2.2.0",
   "regex>=2025.10.22",
   "sentencepiece>=0.2.0",
   "stable-ts-whisperless>=2.18.0",
@@ -36,6 +37,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 lid = ["lingua-language-detector==1.4.2"]
+# CPU GiNZA (ja_ginza, not ja_ginza_electra). Optional so CI can stub spaCy.
+ja = ["ginza", "ja-ginza"]
 
 [project.scripts]
 sublocal = "sublocal.cli:main"

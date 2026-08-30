@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -45,6 +46,9 @@ NAME_HINT_SENTENCE = (
 DEFAULT_N_CTX = 2048
 OOM_N_CTX = 1024
 DEFAULT_MAX_TOKENS = 256
+LENGTH_RETRY_MAX_TOKENS = 512
+# llama-cpp-python create_completion default is 16 — that truncates cues.
+ARROW_MARKERS = ("→", "->", "⇒")
 
 
 @dataclass(frozen=True)
@@ -131,7 +135,7 @@ def gemmax_prompt(
     *,
     name_hint: bool = False,
 ) -> str:
-    """In-distribution GemmaX2 completion prompt. Not a chat template."""
+    """Official GemmaX2 completion prompt. Not a chat template. No glossary."""
     prefix = ""
     if name_hint:
         prefix = f"{NAME_HINT_SENTENCE}\n"
@@ -142,16 +146,87 @@ def gemmax_prompt(
     )
 
 
-def strip_gemmax_completion(text: str, tgt_name: str) -> str:
-    """Drop any echoed prompt; keep the first line/paragraph after the header."""
+def gemmax_stop_sequences(src_name: str) -> list[str]:
+    """Stop the model from starting a new official-prompt example."""
+    stops = [f"\n{src_name}:", "\nJapanese:", "\nTranslate this", "\n\n"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in stops:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def completion_max_tokens(
+    n_ctx: int,
+    prompt_tokens: int,
+    cap: int = DEFAULT_MAX_TOKENS,
+) -> int:
+    """Fit prompt + completion in n_ctx. llama-cpp default 16 is too small."""
+    room = int(n_ctx) - int(prompt_tokens)
+    return max(1, min(int(cap), room))
+
+
+def count_prompt_tokens(llama: object, prompt: str) -> int:
+    """Tokenize the official prompt. 0 if the backend has no tokenizer."""
+    tokenize = getattr(llama, "tokenize", None)
+    if not callable(tokenize):
+        return 0
+    data = prompt.encode("utf-8")
+    try:
+        return len(tokenize(data, add_bos=True))
+    except TypeError:
+        try:
+            return len(tokenize(data))
+        except TypeError:
+            return len(tokenize(prompt))
+
+
+def take_arrow_right(text: str) -> str:
+    """If the completion contains →, keep the right side only."""
+    out = text
+    for marker in ARROW_MARKERS:
+        if marker in out:
+            out = out.rsplit(marker, 1)[-1]
+    return out.strip()
+
+
+def strip_lang_prefixes(text: str, *names: str) -> str:
+    """Strip leading ``Spanish:`` / ``Japanese:`` / target-name headers."""
+    out = text.strip()
+    changed = True
+    while changed and out:
+        changed = False
+        for name in names:
+            if not name:
+                continue
+            prefix = f"{name}:"
+            if out.startswith(prefix):
+                out = out[len(prefix) :].strip()
+                changed = True
+    return out
+
+
+def strip_gemmax_completion(
+    text: str,
+    tgt_name: str,
+    src_name: str | None = None,
+) -> str:
+    """Drop echoed prompt, take the right of →, strip language prefixes."""
     header = f"{tgt_name}:"
     if header in text:
         text = text.rsplit(header, 1)[-1]
-    text = text.strip()
+    text = take_arrow_right(text.strip())
+    text = strip_lang_prefixes(text, tgt_name, src_name or "", "Spanish", "Japanese")
     if not text:
         return ""
     para = text.split("\n\n", 1)[0].strip()
     return para.split("\n", 1)[0].strip()
+
+
+def leftover_arrow_count(text: str) -> int:
+    return sum(text.count(marker) for marker in ARROW_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -202,26 +277,46 @@ def _is_oom(exc: BaseException) -> bool:
     )
 
 
-def _create_llama(model_path: str, n_ctx: int = DEFAULT_N_CTX):
-    """Build llama-cpp Llama. CUDA OOM retries once with n_ctx=1024."""
-    from llama_cpp import Llama
+def _disable_llama_chat(llama: object) -> None:
+    """Gemma2 GGUF may auto-set chat_format from metadata. Completion only."""
+    for attr in ("chat_format", "chat_handler", "_chat_handler"):
+        if hasattr(llama, attr):
+            try:
+                setattr(llama, attr, None)
+            except Exception:
+                pass
 
+
+def _build_llama(Llama, model_path: str, n_ctx: int):
     try:
-        return Llama(
+        llama = Llama(
+            model_path=model_path,
+            n_gpu_layers=-1,
+            n_ctx=n_ctx,
+            logits_all=False,
+            chat_format=None,
+        )
+    except TypeError:
+        llama = Llama(
             model_path=model_path,
             n_gpu_layers=-1,
             n_ctx=n_ctx,
             logits_all=False,
         )
+    _disable_llama_chat(llama)
+    return llama
+
+
+def _create_llama(model_path: str, n_ctx: int = DEFAULT_N_CTX):
+    """Build llama-cpp Llama. CUDA OOM retries once with n_ctx=1024."""
+    from llama_cpp import Llama
+
+    try:
+        return _build_llama(Llama, model_path, n_ctx)
     except Exception as exc:
         if n_ctx > OOM_N_CTX and _is_oom(exc):
             status(f"CUDA out of memory; retrying with n_ctx={OOM_N_CTX}")
-            return Llama(
-                model_path=model_path,
-                n_gpu_layers=-1,
-                n_ctx=OOM_N_CTX,
-                logits_all=False,
-            )
+            return _build_llama(Llama, model_path, OOM_N_CTX)
         raise
 
 
@@ -251,6 +346,7 @@ class GemmaXBackend:
         self.name_hint = name_hint
         self.n_ctx = n_ctx
         self._llama = None
+        self.finish_reason_counts: Counter[str] = Counter()
 
     def prepare(self) -> None:
         self._ensure_loaded()
@@ -302,7 +398,37 @@ class GemmaXBackend:
         path = self._download_gguf()
         status(f"Loading GGUF ({self.filename})")
         self._llama = _create_llama(path, n_ctx=self.n_ctx)
+        n_ctx = getattr(self._llama, "n_ctx", None)
+        if callable(n_ctx):
+            try:
+                self.n_ctx = int(n_ctx())
+            except TypeError:
+                pass
+        elif isinstance(n_ctx, int) and n_ctx > 0:
+            self.n_ctx = n_ctx
         status(f"Model ready (device={self.device})")
+
+    def _create_completion(self, prompt: str, *, max_tokens: int, stop: list[str]):
+        """Official string only. Never create_chat_completion / chat wrapper."""
+        llama = self._llama
+        assert llama is not None
+        complete = getattr(llama, "create_completion", None)
+        if not callable(complete):
+            # llama-cpp Llama.__call__ is create_completion, not chat.
+            complete = llama
+        return complete(
+            prompt=prompt,
+            temperature=0,
+            top_k=1,
+            max_tokens=max_tokens,
+            stop=stop,
+        )
+
+    def _record_finish_reason(self, reason: str | None) -> None:
+        key = (reason or "other").strip().lower() or "other"
+        if key not in {"stop", "length"}:
+            key = "other"
+        self.finish_reason_counts[key] += 1
 
     def translate(
         self, texts: list[str], src_flores: str, tgt_flores: str
@@ -314,6 +440,7 @@ class GemmaXBackend:
         assert llama is not None
         src_name = to_english_name(src_flores)
         tgt_name = to_english_name(tgt_flores)
+        stop = gemmax_stop_sequences(src_name)
         out: list[str] = [""] * len(texts)
         nonempty = [(i, t) for i, t in enumerate(texts) if t.strip()]
         if not nonempty:
@@ -321,24 +448,42 @@ class GemmaXBackend:
         counter = BatchCounter(len(texts))
         empty_count = len(texts) - len(nonempty)
         for n, (orig_i, text) in enumerate(nonempty):
-            hint = self.name_hint or maybe_name_instruction(text)
-            prompt = gemmax_prompt(src_name, tgt_name, text, name_hint=hint)
-            result = llama(
-                prompt,
-                temperature=0,
-                top_k=1,
-                max_tokens=DEFAULT_MAX_TOKENS,
+            # Official prompt only. name_hint stays off — do not stuff names.
+            prompt = gemmax_prompt(src_name, tgt_name, text, name_hint=False)
+            prompt_tokens = count_prompt_tokens(llama, prompt)
+            max_tokens = completion_max_tokens(self.n_ctx, prompt_tokens)
+            result = self._create_completion(
+                prompt, max_tokens=max_tokens, stop=stop
             )
-            raw = ""
-            choices = result.get("choices") if isinstance(result, dict) else None
-            if choices:
-                raw = str(choices[0].get("text") or "")
-            out[orig_i] = strip_gemmax_completion(raw, tgt_name)
+            raw, reason = _choice_text_and_reason(result)
+            if reason == "length":
+                bumped = completion_max_tokens(
+                    self.n_ctx, prompt_tokens, cap=LENGTH_RETRY_MAX_TOKENS
+                )
+                if bumped > max_tokens:
+                    result = self._create_completion(
+                        prompt, max_tokens=bumped, stop=stop
+                    )
+                    raw, reason = _choice_text_and_reason(result)
+            self._record_finish_reason(reason)
+            out[orig_i] = strip_gemmax_completion(raw, tgt_name, src_name)
             step = 1
             if n == 0 and empty_count:
                 step += empty_count
             counter.update(step)
         return out
+
+
+def _choice_text_and_reason(result: object) -> tuple[str, str | None]:
+    raw = ""
+    reason: str | None = None
+    choices = result.get("choices") if isinstance(result, dict) else None
+    if choices:
+        raw = str(choices[0].get("text") or "")
+        finish = choices[0].get("finish_reason")
+        if finish is not None:
+            reason = str(finish)
+    return raw, reason
 
 
 def _quiet_ct2_debug() -> None:

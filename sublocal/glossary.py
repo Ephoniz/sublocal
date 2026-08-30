@@ -1,14 +1,12 @@
-"""Glossary placeholders for NLLB (no prompt) and Whisper canonicalization.
+"""Longest-first xxNxx protect-restore (original v0.3).
 
-NLLB has no prompt, so proper names must be pulled out of the source string
-before translation. Injecting Latin (Drum, Nozaki) into Japanese is how
-ドラム became tambor — the model then "translates" the English word.
+Names are pulled out of the source string before MT. Injecting Latin
+(Drum, Nozaki) into Japanese is how ドラム became tambor — the model then
+"translates" the English word.
 
-GPU path: send the original Japanese sentence (バンコク stays inside
-バンコクに飛んだ). After MT, ``overlay_names`` writes Latin over surviving
-JP keys, known aliases (tambor→Drum, Nagasaki→Nozaki), and moon/luna
-when バンコク was in the source. ``protect`` / ``GLS{n}`` stay for
-unit tests and the no-kanji local skip — they are not sent to NLLB.
+Algorithm: longest-first replace of source keys with opaque ASCII sentinels
+``xx{n}xx``, send the protected cue through the official GemmaX2 prompt,
+restore by exact match. A missing sentinel fails the cue.
 """
 
 from __future__ import annotations
@@ -17,9 +15,8 @@ import re
 from pathlib import Path
 from typing import Literal
 
-# Copy-stable MT token. Also accept spaced/cased mutations and XML retry tags.
-_GLS_RE = re.compile(r"GLS\s*(\d+)", re.IGNORECASE)
-_XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
+# Mutations a model sometimes emits around the opaque sentinel.
+_SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
 _WRAPPERS = "《》＜＞「」『』"
@@ -37,15 +34,11 @@ class GlossaryError(RuntimeError):
 
 
 def _sentinel(n: int) -> str:
-    return f"GLS{n}"
-
-
-def _xml_sentinel(n: int) -> str:
-    return f"<g{n}>"
+    return f"xx{n}xx"
 
 
 def canonicalize_sentinels(text: str, pair_count: int) -> str:
-    """Normalize ``GLS 0`` / ``gls0`` / ``<g0>`` to ``GLS{n}`` when in range."""
+    """Normalize ``xx 0 xx`` / ``XX0XX`` to ``xx{n}xx`` when ``n`` is in range."""
 
     def _canon(match: re.Match[str]) -> str:
         n = int(match.group(1))
@@ -53,16 +46,15 @@ def canonicalize_sentinels(text: str, pair_count: int) -> str:
             return _sentinel(n)
         return match.group(0)
 
-    out = _XML_RE.sub(_canon, text)
-    return _GLS_RE.sub(_canon, out)
+    return _SENTINEL_MUTATION_RE.sub(_canon, text)
 
 
 def _strip_sentinels(text: str) -> str:
-    return _GLS_RE.sub("", _XML_RE.sub("", text))
+    return _SENTINEL_MUTATION_RE.sub("", text)
 
 
 def needs_nllb(protected: str) -> bool:
-    """True iff a CJK ideograph remains after stripping GLS / ``<gN>`` tokens."""
+    """True iff a CJK ideograph remains after stripping ``xxNxx`` tokens."""
     return _CJK_RE.search(_strip_sentinels(protected)) is not None
 
 
@@ -92,7 +84,7 @@ def load_mapping(path: str | Path) -> dict[str, str]:
 
 
 class Glossary:
-    """Longest-first JP → ``GLS{n}`` protection and restore."""
+    """Longest-first source → ``xx{n}xx`` protection and restore."""
 
     def __init__(self, mapping: dict[str, str]) -> None:
         if not mapping:
@@ -126,10 +118,10 @@ class Glossary:
         return inner, rest
 
     def protect(self, text: str) -> tuple[str, list[tuple[str, str]]]:
-        """Replace each JP key with spaced ``GLS{n}``. Never inject Latin.
+        """Replace each source key with ``xx{n}xx``. Never inject Latin values.
 
-        ``バンコクに飛んだ`` → ``GLS0 に飛んだ`` (に飛んだ stays in the same
-        string). ``おい ドラム 東条 …`` → ``おい GLS0 GLS1 …``.
+        Keys are applied longest-first so ウラジオストク is not eaten by a
+        shorter substring. ``野崎です`` → ``xx0xxです``.
         """
         pairs: list[tuple[str, str]] = []
         out = text
@@ -141,20 +133,11 @@ class Glossary:
                 idx = out.find(key, start)
                 if idx < 0:
                     break
-                token = f" {_sentinel(len(pairs))} "
+                token = _sentinel(len(pairs))
                 out = out[:idx] + token + out[idx + len(key) :]
                 pairs.append((key, value))
                 start = idx + len(token)
-        out = re.sub(r"[^\S\n]+", " ", out)
-        out = re.sub(r" *\n *", "\n", out)
-        return out.strip(), pairs
-
-    def to_xml(self, protected: str, pair_count: int) -> str:
-        """Retry form: ``GLS{n}`` → ``<g{n}>``."""
-        canon = canonicalize_sentinels(protected, pair_count)
-        for i in range(pair_count):
-            canon = canon.replace(_sentinel(i), _xml_sentinel(i))
-        return canon
+        return out, pairs
 
     def missing_sentinels(self, text: str, pairs: list[tuple[str, str]]) -> list[int]:
         canon = canonicalize_sentinels(text, len(pairs))
@@ -167,7 +150,11 @@ class Glossary:
         *,
         target: Literal["value", "key"] = "value",
     ) -> str:
-        """Put sentinels back. ``target='value'`` → Latin; ``'key'`` → JP."""
+        """Put sentinels back. ``target='value'`` → Latin; ``'key'`` → JP.
+
+        Exact ``xx{n}xx`` after light canonicalization. Fail if a sentinel
+        is missing — do not silently drop names.
+        """
         out = canonicalize_sentinels(text, len(pairs))
         for i, (key, value) in enumerate(pairs):
             token = _sentinel(i)
@@ -181,13 +168,7 @@ class Glossary:
         return out
 
     def overlay_names(self, source: str, mt: str) -> str:
-        """Write Latin names onto an MT string. Never used as an NLLB input.
-
-        Surviving JP keys → Latin (longest-first). Known aliases
-        (tambor→Drum, Nagasaki→Nozaki). If バンコク was in ``source`` and
-        Bangkok is missing, ``the moon`` / ``la luna`` become Bangkok.
-        Any required Latin still missing is prepended.
-        """
+        """Legacy NLLB overlay. Not used on the GemmaX2 protect-restore path."""
         required: list[str] = []
         out = mt
         for key, value in self.entries:
