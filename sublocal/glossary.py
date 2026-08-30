@@ -27,9 +27,9 @@ _SPLIT_RE = re.compile(
     r"+"
 )
 
-# うっ+/あっ+/えっ+/ああ+/ええ+/ん+/だっ+/ヒー+
+# Groans: うっ+ / あっ+ / えっ+ (also ううっ = う+っ+), ああ+ / ええ+ / ん+ / だっ+ / ヒー+.
 # ー is also a split char, so ヒー collapses to ヒ after tokenize.
-_GROAN_RE = re.compile(r"^(?:うっ+|あっ+|えっ+|ああ+|ええ+|ん+|だっ+|ヒー+|ヒ)$")
+_GROAN_RE = re.compile(r"^(?:う+っ+|あ+っ+|え+っ+|ああ+|ええ+|ん+|だっ+|ヒー+|ヒ)$")
 
 
 class GlossaryError(RuntimeError):
