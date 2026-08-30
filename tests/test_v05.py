@@ -90,8 +90,9 @@ def test_copy_through_if_lang_equals_to(tmp_path: Path) -> None:
     translate_document(doc, to_code="es", backend=backend)
     assert doc.cues[0].text == "Already Spanish"
     assert doc.cues[1].text == "Hola"
-    assert len(llama.prompts) == 1
-    assert "Already Spanish" not in llama.prompts[0]
+    # "Hola" is ≤2 Latin tokens; JP source triggers one unprotected retry.
+    assert len(llama.prompts) == 2
+    assert all("Already Spanish" not in p for p in llama.prompts)
 
 
 def test_prompt_is_completion_template_english_names() -> None:

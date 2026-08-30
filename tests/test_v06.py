@@ -31,7 +31,7 @@ from sublocal.extract import (
     spacy_load_ja_ginza,
 )
 from sublocal.formats import load
-from sublocal.glossary import Glossary, GlossaryError
+from sublocal.glossary import Glossary, GlossaryError, is_names_only_output
 from sublocal.pipeline import translate_document, translate_file
 
 
@@ -506,6 +506,117 @@ def test_sentinel_only_cue_sends_original_jp(tmp_path: Path) -> None:
     assert doc.cues[0].text != "Beppan"
 
 
+def _is_protected_send(texts: list[str]) -> bool:
+    return any("xx" in t or "<g" in t for t in texts)
+
+
+def test_names_only_tokens_trigger_unprotected_retry() -> None:
+    assert is_names_only_output("")
+    assert is_names_only_output("(Sano)")
+    assert is_names_only_output("Nozaki")
+    assert is_names_only_output("(Sano) Nozaki")
+    assert is_names_only_output("Beppan")
+    assert is_names_only_output(" (Sano)  → ")
+    assert not is_names_only_output(
+        "Hace cinco años, Nozaki estaba en Beijing."
+    )
+
+
+def test_sano_only_completion_retries_unprotected(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "sano.srt",
+        [("00:00:00,000 --> 00:00:02,000", "（佐野）5年前 野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class SanoThenSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            if _is_protected_send(texts):
+                return ["(Sano)" for _ in texts]
+            if any(is_names_only_output(t) for t in texts):
+                return ["(Sano)" for _ in texts]
+            return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=SanoThenSentence(),
+        glossary=Glossary({"野崎": "Nozaki", "佐野": "Sano"}),
+    )
+    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
+    assert unprotected
+    assert any("（佐野）" in batch[0] or "野崎" in batch[0] for batch in unprotected)
+    assert all("xx" not in t and "<g" not in t for t in unprotected[-1])
+    assert "Hace cinco años" in doc.cues[0].text
+    assert doc.cues[0].text != "(Sano)"
+    assert doc.cues[0].text != "Nozaki"
+
+
+def test_nozaki_only_completion_retries_unprotected(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "nozaki.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class NozakiThenSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            if _is_protected_send(texts):
+                return ["Nozaki" for _ in texts]
+            return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=NozakiThenSentence(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
+    assert unprotected
+    assert any("野崎" in batch[0] for batch in unprotected)
+    assert "Hace cinco años" in doc.cues[0].text
+    assert doc.cues[0].text != "Nozaki"
+
+
+def test_sentence_with_nozaki_does_not_retry(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "sent.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class KeepSentinelSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            out: list[str] = []
+            for text in texts:
+                if "xx0xx" in text:
+                    out.append("Hace cinco años, xx0xx estaba en Beijing.")
+                else:
+                    out.append("Hace cinco años, Nozaki estaba en Beijing.")
+            return out
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=KeepSentinelSentence(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    assert len(calls) == 1
+    assert "Hace cinco años, Nozaki estaba en Beijing." == doc.cues[0].text
+
+
 def test_empty_completion_retries_unprotected(tmp_path: Path) -> None:
     src = _srt(
         tmp_path,
@@ -517,7 +628,7 @@ def test_empty_completion_retries_unprotected(tmp_path: Path) -> None:
     class EmptyThenSentence(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
             calls.append(list(texts))
-            if len(calls) == 1:
+            if _is_protected_send(texts):
                 return ["" for _ in texts]
             return ["Hablo de un vuelo urgente" for _ in texts]
 
@@ -529,8 +640,8 @@ def test_empty_completion_retries_unprotected(tmp_path: Path) -> None:
         backend=EmptyThenSentence(),
         glossary=Glossary({"野崎": "Nozaki"}),
     )
-    assert len(calls) >= 2
-    assert all(cues[0].text for cues in [doc.cues])
+    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
+    assert unprotected
     assert doc.cues[0].text.strip()
     assert "Nozaki" in doc.cues[0].text or "Hablo" in doc.cues[0].text
 

@@ -86,17 +86,29 @@ def leftover_has_jp_content(protected: str) -> bool:
     return _JP_ANY_RE.search(stripped) is not None
 
 
-def is_names_only_output(text: str, latin_values: list[str]) -> bool:
-    """Empty, or only restored names / sentinels / arrows / punctuation."""
-    out = text.strip()
-    if not out:
+_LATIN_NAME_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9'.-]*")
+
+
+def is_names_only_output(
+    text: str, latin_values: list[str] | None = None
+) -> bool:
+    """Empty, or leftover JP gone and ≤2 Latin name/speaker tokens.
+
+    ``(Sano)``, ``Nozaki``, ``(Sano) Nozaki``, ``Beppan`` are True.
+    A real sentence that happens to contain Nozaki is False.
+    ``latin_values`` is unused; detection is structural, not glossary-gated.
+    """
+    del latin_values
+    raw = text.strip()
+    if not raw:
         return True
-    for latin in sorted({v for v in latin_values if v}, key=len, reverse=True):
-        out = re.sub(re.escape(latin), " ", out, flags=re.IGNORECASE)
-    out = _SENTINEL_MUTATION_RE.sub(" ", out)
-    out = _XML_RE.sub(" ", out)
-    out = _NAMES_ONLY_PUNCT_RE.sub("", out)
-    return not out.strip()
+    if leftover_has_jp_content(raw):
+        return False
+    cleaned = _SENTINEL_MUTATION_RE.sub(" ", raw)
+    cleaned = _XML_RE.sub(" ", cleaned)
+    cleaned = _NAMES_ONLY_PUNCT_RE.sub(" ", cleaned)
+    tokens = _LATIN_NAME_TOKEN_RE.findall(cleaned)
+    return len(tokens) <= 2
 
 
 def load_mapping(path: str | Path) -> dict[str, str]:

@@ -21,7 +21,6 @@ from sublocal.glossary import (
     Glossary,
     GlossaryError,
     as_glossary,
-    has_cjk,
     is_names_only_output,
     leftover_has_jp_content,
 )
@@ -151,10 +150,17 @@ def translate_document(
         if gloss is not None:
             speaker_jp, rest = gloss.peel_speaker(work)
             if speaker_jp is not None:
-                speaker_prefix[i] = f"({gloss.mapping[speaker_jp]})"
-                if not has_cjk(rest):
-                    translated[i] = speaker_prefix[i] or ""
+                if not leftover_has_jp_content(rest):
+                    # Empty/punct rest: official prompt on ORIGINAL JP, then overlay.
+                    # Do not finalize as "(Sano)" — names-only retry must still fire.
+                    send = text
+                    overlay_only[i] = True
+                    source_by_i[i] = text
+                    pairs_by_i[i] = []
+                    groups.setdefault(src, []).append(i)
+                    texts[i] = send
                     continue
+                speaker_prefix[i] = f"({gloss.mapping[speaker_jp]})"
                 work = rest
             guarded, pairs = gloss.protect(work)
             protect_count += len(pairs)
@@ -227,20 +233,21 @@ def translate_document(
                 latins = [v for _, v in pairs_by_i[i]]
             if gloss is not None and latins:
                 body = gloss.cleanup_adjacent(body, latins)
-            if speaker_prefix[i]:
-                latins = list(latins) + [speaker_prefix[i].strip("()")]
-            body = _with_speaker(speaker_prefix[i], body)
-            if gloss is not None and (
-                is_names_only_output(body, latins) or has_cjk(body)
+            if is_names_only_output(body, latins) and leftover_has_jp_content(
+                orig_cue_by_i[i]
             ):
                 status(f"Cue {i + 1}: empty/names-only ES; retry unprotected original")
-                original = source_by_i[i] or orig_cue_by_i[i]
+                original = orig_cue_by_i[i]
                 retry = backend.translate([original], src, tgt)
                 retry_text = retry[0] if retry else ""
-                body = gloss.overlay_names(original, retry_text)
-                all_latins = [v for k, v in gloss.entries if k in original]
-                if all_latins:
-                    body = gloss.cleanup_adjacent(body, all_latins)
+                if gloss is not None:
+                    body = gloss.overlay_names(original, retry_text)
+                    all_latins = [v for k, v in gloss.entries if k in original]
+                    if all_latins:
+                        body = gloss.cleanup_adjacent(body, all_latins)
+                else:
+                    body = retry_text
+            else:
                 body = _with_speaker(speaker_prefix[i], body)
             translated[i] = body
     elapsed = time.monotonic() - started
