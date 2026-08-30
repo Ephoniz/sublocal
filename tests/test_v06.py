@@ -1,4 +1,4 @@
-"""v0.6: completion max_tokens 256, arrow strip, xxNxx glossary. No 9B."""
+"""v0.6: completion max_tokens 256, in-source Person Hepburn. No 9B / xxNxx MT."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from sublocal.extract import (
     GINZA_LABELS,
     GINZA_LOAD_CONFIG,
     GINZA_MODEL,
+    GINZA_PERSON_LABELS,
     extract_file_glossary,
     extract_ginza_ents,
     extract_speakers,
@@ -200,7 +201,7 @@ def test_missing_sentinel_fails() -> None:
 
 
 def test_speakers_and_latin_file_glossary_without_ginza() -> None:
-    mapping, count = extract_file_glossary(
+    mapping, count, persons = extract_file_glossary(
         ["《野崎》Liuです", "【佐野】hello"],
         ["ja", "ja"],
         nlp=None,
@@ -210,6 +211,8 @@ def test_speakers_and_latin_file_glossary_without_ginza() -> None:
     assert "Liu" in mapping and mapping["Liu"] == "Liu"
     assert "野崎" in mapping
     assert "佐野" in mapping
+    assert "野崎" in persons
+    assert "佐野" in persons
     assert extract_speakers("（東条）ううっ") == ["東条"]
 
 
@@ -228,7 +231,7 @@ def test_ginza_ents_via_stub_nlp() -> None:
                 ents.append(Ent("バンコク", "Place"))
             return type("Doc", (), {"ents": ents})()
 
-    mapping, count = extract_file_glossary(
+    mapping, count, persons = extract_file_glossary(
         ["野崎がバンコクに飛んだ"],
         ["ja"],
         nlp=Nlp(),
@@ -237,6 +240,8 @@ def test_ginza_ents_via_stub_nlp() -> None:
     assert count == 2
     assert mapping["野崎"]
     assert mapping["バンコク"]
+    assert "野崎" in persons
+    assert "バンコク" not in persons
 
 
 def test_merge_yaml_wins_on_conflict() -> None:
@@ -247,6 +252,7 @@ def test_merge_yaml_wins_on_conflict() -> None:
 
 def test_ginza_labels_are_person_place_not_spacy_person() -> None:
     assert GINZA_LABELS == frozenset({"Person", "Place", "N_Person"})
+    assert GINZA_PERSON_LABELS == frozenset({"Person", "N_Person"})
     assert "PERSON" not in GINZA_LABELS
     assert "GPE" not in GINZA_LABELS
     assert "Government" not in GINZA_LABELS
@@ -298,7 +304,7 @@ def test_ginza_skips_government_keeps_person() -> None:
     spans = extract_ginza_ents("野崎は公安だ", Nlp())
     assert "野崎" in spans
     assert "公安" not in spans
-    mapping, count = extract_file_glossary(
+    mapping, count, _persons = extract_file_glossary(
         ["野崎は公安だ"],
         ["ja"],
         nlp=Nlp(),
@@ -319,7 +325,7 @@ def test_pykakasi_version_from_metadata() -> None:
     assert getattr(pykakasi, "__version__", None) in {None, ver}
 
 
-def test_file_glossary_protects_latin_liu(tmp_path: Path) -> None:
+def test_file_glossary_keeps_latin_liu_in_jp_sentence(tmp_path: Path) -> None:
     src = _srt(
         tmp_path,
         "names.srt",
@@ -328,15 +334,12 @@ def test_file_glossary_protects_latin_liu(tmp_path: Path) -> None:
     llama = RecordingLlama()
     llama.tokenize = None  # type: ignore[method-assign]
 
-    def echo_sentinels(prompt=None, **kwargs):
+    def echo_latin(prompt=None, **kwargs):
         llama.prompts.append(prompt)
         llama.kwargs.append(kwargs)
-        import re
+        return {"choices": [{"text": "Hola Liu y Zhang", "finish_reason": "stop"}]}
 
-        found = re.findall(r"xx\d+xx", prompt or "")
-        return {"choices": [{"text": "Hola " + " ".join(found), "finish_reason": "stop"}]}
-
-    llama.create_completion = echo_sentinels  # type: ignore[method-assign]
+    llama.create_completion = echo_latin  # type: ignore[method-assign]
     backend = GemmaXBackend(device="cpu")
     backend._llama = llama
     doc = load(src)
@@ -344,8 +347,10 @@ def test_file_glossary_protects_latin_liu(tmp_path: Path) -> None:
     translate_document(doc, to_code="es", backend=backend)
     assert llama.prompts
     cue_line = llama.prompts[0].split("Japanese:", 1)[-1]
-    assert "Liu" not in cue_line
-    assert "Zhang" not in cue_line
+    assert "xx" not in cue_line
+    assert "<g" not in cue_line
+    assert "Liu" in cue_line
+    assert "Zhang" in cue_line
     assert "Liu" in doc.cues[0].text
     assert "Zhang" in doc.cues[0].text
 
@@ -363,9 +368,11 @@ def test_translate_logs_ginza_and_finish(tmp_path: Path, capsys) -> None:
     translate_file(src, to_code="es", from_code="ja", backend=backend)
     err = capsys.readouterr().err
     assert "GiNZA entities" in err
-    assert "Protected" in err
+    assert "in-source Person Hepburn" in err
     assert "finish_reason stop=" in err
     assert "leftover arrows" in err
+    assert "src_original retries" in err
+    assert "used_src_original=" in err
     assert "MT pass" in err
 
 
@@ -415,12 +422,15 @@ def test_junk_clause_keys_not_in_extracted_map() -> None:
         "野崎さん",
         "諜報機関だ",
     ]
-    mapping, _count = extract_file_glossary(
+    mapping, _count, persons = extract_file_glossary(
         texts, ["ja"] * len(texts), nlp=Nlp(), load=False
     )
     assert "野崎" in mapping
     assert "佐野" in mapping
     assert "別班" in mapping
+    assert "野崎" in persons
+    assert "佐野" in persons
+    assert "別班" not in persons
     assert "撮影開始" not in mapping
     assert "諜報機関" not in mapping
     assert "野崎が大きく息を吐く" not in mapping
@@ -433,52 +443,221 @@ def test_junk_clause_keys_not_in_extracted_map() -> None:
     assert is_acceptable_name_key("野崎")
 
 
-def test_missing_sentinel_fails_cue_not_document(tmp_path: Path, capsys) -> None:
+def test_no_xxnxx_in_mt_path(tmp_path: Path) -> None:
     src = _srt(
         tmp_path,
-        "ep16.srt",
-        [
-            ("00:00:10,000 --> 00:00:12,000", "（佐野）5年前 野崎は北京で飛んだ"),
-            ("00:00:12,000 --> 00:00:14,000", "こんにちは"),
-        ],
+        "mark.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎をマークしていた")],
     )
-    gloss = Glossary({"野崎": "Nozaki", "佐野": "Sano"})
+    calls: list[list[str]] = []
 
-    class DropSentinel(EchoBackend):
+    class Rec(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
-            out: list[str] = []
-            for text in texts:
-                if "xx" in text or "<g" in text:
-                    out.append("hace cinco anos en Beijing")
-                else:
-                    out.append("Hola")
-            return out
+            calls.append(list(texts))
+            return ["Estaba marcando a Nozaki" for _ in texts]
 
     doc = load(src)
-    translate_document(doc, to_code="es", from_code="ja", backend=DropSentinel(), glossary=gloss)
-    assert "Nozaki" in doc.cues[0].text
-    assert "野崎" not in doc.cues[0].text
-    assert doc.cues[1].text == "Hola"
-    err = capsys.readouterr().err
-    assert "overlay leftover names" in err
-    assert "finish_reason stop=" in err
-    assert "leftover arrows" in err
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=Rec(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    assert calls
+    sent = calls[0][0]
+    assert "xx" not in sent
+    assert "<g" not in sent
+    assert "Nozakiをマークしていた" == sent
+    assert "野崎" not in sent
 
 
-def test_sentinel_only_cue_sends_original_jp(tmp_path: Path) -> None:
+def test_hepburn_in_prompt_source_not_xxnxx() -> None:
+    g = Glossary({"野崎": "Nozaki"})
+    assert g.hepburn_in_source("野崎をマークしていた") == "Nozakiをマークしていた"
+    protected, _pairs = g.protect("野崎をマークしていた")
+    assert "xx0xx" in protected
+    assert g.hepburn_in_source("野崎をマークしていた") != protected
+
+
+def test_speaker_tag_skips_gemmax(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "tags.srt",
+        [
+            ("00:00:00,000 --> 00:00:01,000", "（佐野）"),
+            ("00:00:01,000 --> 00:00:02,000", "野崎"),
+            ("00:00:02,000 --> 00:00:04,000", "野崎をマークしていた"),
+        ],
+    )
+    calls: list[list[str]] = []
+
+    class Rec(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            return ["Estaba marcando a Nozaki" for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=Rec(),
+        glossary=Glossary({"野崎": "Nozaki", "佐野": "Sano"}),
+    )
+    assert len(calls) == 1
+    assert calls[0] == ["Nozakiをマークしていた"]
+    assert doc.cues[0].text == "(Sano)"
+    assert doc.cues[1].text == "Nozaki"
+    assert "Estaba marcando" in doc.cues[2].text
+    assert doc.cues[2].text != "Nozaki"
+
+
+def test_names_only_is_person_set_without_verb() -> None:
+    persons = {"Sano", "Nozaki"}
+    assert is_names_only_output("", persons)
+    assert is_names_only_output("(Sano)", persons)
+    assert is_names_only_output("Nozaki", persons)
+    assert is_names_only_output("(Sano) Nozaki", persons)
+    assert is_names_only_output("Nozaki Sano", persons)
+    assert not is_names_only_output("Beppan", persons)
+    assert not is_names_only_output(
+        "Hace cinco años, Nozaki estaba en Beijing.", persons
+    )
+
+
+def test_empty_retry_uses_src_original_jp(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "empty.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class EmptyThenSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            if any("野崎" in t for t in texts):
+                return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
+            return ["" for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=EmptyThenSentence(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    assert len(calls) == 2
+    assert "Nozakiを" in calls[0][0] or "Nozakiは" in calls[0][0]
+    assert "xx" not in calls[0][0]
+    assert "野崎" in calls[1][0]
+    assert "Nozaki" not in calls[1][0] or "野崎" in calls[1][0]
+    assert calls[1][0] == "野崎は北京で飛んだ"
+    assert "Hace cinco años" in doc.cues[0].text
+
+
+def test_names_only_retry_uses_original_jp_not_name_pile(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "pile.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class PileThenSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            if any("野崎" in t and "Nozaki" not in t.replace("野崎", "") for t in texts):
+                return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
+            return ["Nozaki Sano" for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=PileThenSentence(),
+        glossary=Glossary({"野崎": "Nozaki", "佐野": "Sano"}),
+    )
+    assert any("野崎" in batch[0] for batch in calls)
+    assert all("xx" not in t for batch in calls for t in batch)
+    assert "Hace cinco años" in doc.cues[0].text
+    assert doc.cues[0].text != "Nozaki Sano"
+
+
+def test_still_empty_emits_src_original_not_name_pile(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "still.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+
+    class AlwaysPile(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            return ["Nozaki Sano" for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=AlwaysPile(),
+        glossary=Glossary({"野崎": "Nozaki", "佐野": "Sano"}),
+    )
+    assert doc.cues[0].text == "野崎は北京で飛んだ"
+    assert doc.cues[0].text != "Nozaki Sano"
+
+
+def test_nagasaki_overlay_iff_source_had_nozaki() -> None:
+    g = Glossary({"野崎": "Nozaki"})
+    out = g.overlay_names("野崎は北京で", "Hace cinco años, Nagasaki estaba en Beijing.")
+    assert "Nozaki" in out
+    assert "Nagasaki" not in out
+    untouched = g.overlay_names("北京で", "Hace cinco años, Nagasaki estaba en Beijing.")
+    assert "Nagasaki" in untouched
+    assert not untouched.startswith("Nozaki")
+
+
+def test_sentence_with_nozaki_does_not_retry(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "sent.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class Sentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=Sentence(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    assert len(calls) == 1
+    assert "xx" not in calls[0][0]
+    assert "Hace cinco años, Nozaki estaba en Beijing." == doc.cues[0].text
+
+
+def test_beppan_stays_japanese_in_prompt(tmp_path: Path) -> None:
     src = _srt(
         tmp_path,
         "beppan.srt",
-        [("00:00:00,000 --> 00:00:02,000", "別班は→")],
+        [("00:00:00,000 --> 00:00:02,000", "当然 別班は裏であり")],
     )
     llama = RecordingLlama()
     llama.tokenize = None  # type: ignore[method-assign]
-    seen: list[str] = []
 
     def complete(prompt=None, **kwargs):
         llama.prompts.append(prompt)
         llama.kwargs.append(kwargs)
-        seen.append(prompt or "")
         return {
             "choices": [
                 {"text": "La seccion secreta opera en la sombra", "finish_reason": "stop"}
@@ -494,156 +673,16 @@ def test_sentinel_only_cue_sends_original_jp(tmp_path: Path) -> None:
         to_code="es",
         from_code="ja",
         backend=backend,
-        glossary=Glossary({"別班": "Beppan"}),
+        glossary=Glossary({"別班": "Beppan", "野崎": "Nozaki"}),
     )
-    assert llama.prompts
     sent = llama.prompts[0]
     assert "別班" in sent
+    assert "Beppan" not in sent.split("Japanese:", 1)[-1].split("Spanish:", 1)[0]
     assert "xx0xx" not in sent
     assert "Hepburn" not in sent
     assert "Keep person names" not in sent
-    assert "Beppan" in doc.cues[0].text
     assert doc.cues[0].text != "Beppan"
-
-
-def _is_protected_send(texts: list[str]) -> bool:
-    return any("xx" in t or "<g" in t for t in texts)
-
-
-def test_names_only_tokens_trigger_unprotected_retry() -> None:
-    assert is_names_only_output("")
-    assert is_names_only_output("(Sano)")
-    assert is_names_only_output("Nozaki")
-    assert is_names_only_output("(Sano) Nozaki")
-    assert is_names_only_output("Beppan")
-    assert is_names_only_output(" (Sano)  → ")
-    assert not is_names_only_output(
-        "Hace cinco años, Nozaki estaba en Beijing."
-    )
-
-
-def test_sano_only_completion_retries_unprotected(tmp_path: Path) -> None:
-    src = _srt(
-        tmp_path,
-        "sano.srt",
-        [("00:00:00,000 --> 00:00:02,000", "（佐野）5年前 野崎は北京で飛んだ")],
-    )
-    calls: list[list[str]] = []
-
-    class SanoThenSentence(EchoBackend):
-        def translate(self, texts, src_flores, tgt_flores):
-            calls.append(list(texts))
-            if _is_protected_send(texts):
-                return ["(Sano)" for _ in texts]
-            if any(is_names_only_output(t) for t in texts):
-                return ["(Sano)" for _ in texts]
-            return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
-
-    doc = load(src)
-    translate_document(
-        doc,
-        to_code="es",
-        from_code="ja",
-        backend=SanoThenSentence(),
-        glossary=Glossary({"野崎": "Nozaki", "佐野": "Sano"}),
-    )
-    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
-    assert unprotected
-    assert any("（佐野）" in batch[0] or "野崎" in batch[0] for batch in unprotected)
-    assert all("xx" not in t and "<g" not in t for t in unprotected[-1])
-    assert "Hace cinco años" in doc.cues[0].text
-    assert doc.cues[0].text != "(Sano)"
-    assert doc.cues[0].text != "Nozaki"
-
-
-def test_nozaki_only_completion_retries_unprotected(tmp_path: Path) -> None:
-    src = _srt(
-        tmp_path,
-        "nozaki.srt",
-        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
-    )
-    calls: list[list[str]] = []
-
-    class NozakiThenSentence(EchoBackend):
-        def translate(self, texts, src_flores, tgt_flores):
-            calls.append(list(texts))
-            if _is_protected_send(texts):
-                return ["Nozaki" for _ in texts]
-            return ["Hace cinco años, Nozaki estaba en Beijing." for _ in texts]
-
-    doc = load(src)
-    translate_document(
-        doc,
-        to_code="es",
-        from_code="ja",
-        backend=NozakiThenSentence(),
-        glossary=Glossary({"野崎": "Nozaki"}),
-    )
-    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
-    assert unprotected
-    assert any("野崎" in batch[0] for batch in unprotected)
-    assert "Hace cinco años" in doc.cues[0].text
-    assert doc.cues[0].text != "Nozaki"
-
-
-def test_sentence_with_nozaki_does_not_retry(tmp_path: Path) -> None:
-    src = _srt(
-        tmp_path,
-        "sent.srt",
-        [("00:00:00,000 --> 00:00:02,000", "野崎は北京で飛んだ")],
-    )
-    calls: list[list[str]] = []
-
-    class KeepSentinelSentence(EchoBackend):
-        def translate(self, texts, src_flores, tgt_flores):
-            calls.append(list(texts))
-            out: list[str] = []
-            for text in texts:
-                if "xx0xx" in text:
-                    out.append("Hace cinco años, xx0xx estaba en Beijing.")
-                else:
-                    out.append("Hace cinco años, Nozaki estaba en Beijing.")
-            return out
-
-    doc = load(src)
-    translate_document(
-        doc,
-        to_code="es",
-        from_code="ja",
-        backend=KeepSentinelSentence(),
-        glossary=Glossary({"野崎": "Nozaki"}),
-    )
-    assert len(calls) == 1
-    assert "Hace cinco años, Nozaki estaba en Beijing." == doc.cues[0].text
-
-
-def test_empty_completion_retries_unprotected(tmp_path: Path) -> None:
-    src = _srt(
-        tmp_path,
-        "empty.srt",
-        [("00:00:00,000 --> 00:00:02,000", "野崎が飛んだ")],
-    )
-    calls: list[list[str]] = []
-
-    class EmptyThenSentence(EchoBackend):
-        def translate(self, texts, src_flores, tgt_flores):
-            calls.append(list(texts))
-            if _is_protected_send(texts):
-                return ["" for _ in texts]
-            return ["Hablo de un vuelo urgente" for _ in texts]
-
-    doc = load(src)
-    translate_document(
-        doc,
-        to_code="es",
-        from_code="ja",
-        backend=EmptyThenSentence(),
-        glossary=Glossary({"野崎": "Nozaki"}),
-    )
-    unprotected = [batch for batch in calls if not _is_protected_send(batch)]
-    assert unprotected
-    assert doc.cues[0].text.strip()
-    assert "Nozaki" in doc.cues[0].text or "Hablo" in doc.cues[0].text
+    assert "seccion" in doc.cues[0].text
 
 
 def test_create_completion_max_tokens_still_256() -> None:
@@ -653,4 +692,5 @@ def test_create_completion_max_tokens_still_256() -> None:
     backend._llama = llama
     backend.translate(["こんにちは"], "jpn_Jpan", "spa_Latn")
     assert llama.kwargs[0]["max_tokens"] == 256
+    assert llama.kwargs[0].get("add_special_tokens") is False
     assert "create_chat_completion" not in llama.kwargs[0]

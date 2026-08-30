@@ -2,7 +2,7 @@
 
 Local-only subtitle translation and transcription. No cloud APIs, no API keys, no telemetry.
 
-v0.6 is one command: transcribe mixed-language audio/video, stamp a language on each cue, unload Whisper, then **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF per cue via llama-cpp-python CUDA. A CPU GiNZA pass builds a file-local name glossary (not GemmaX2 NER); names are `xxNxx`-protected before the official completion prompt.
+v0.6 is one command: transcribe mixed-language audio/video, stamp a language on each cue, unload Whisper, then **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF per cue via llama-cpp-python CUDA. A CPU GiNZA pass finds Person surfaces (not GemmaX2 NER). Those names are Hepburn-replaced **in a copy** of the Japanese (`野崎をマーク` → `Nozakiをマーク`) before the official completion prompt. Opaque `xxNxx` sentinels are not used on the MT path.
 
 ```bash
 sublocal clip.mp4 --to es
@@ -10,7 +10,7 @@ sublocal clip.mp4 --to es
 
 The end result is `clip.es.srt` (the overlay file); `clip.cues.jsonl` is an optional lang sidecar for debug (`start`, `end`, `text`, `lang`), not the overlay. No `--language` required. Whisper `task=translate` is never the Spanish path.
 
-NLLB is no longer the default. `--glossary` YAML is still opt-in extra and is merged longest-first with the file-extracted map. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese (or other non-Latin) cue are copied through (Liu/Zhang stay Latin). Kanji person/place names come from CPU GiNZA + speaker brackets + pykakasi Hepburn (`野崎` → `Nozaki`), then `xxNxx` protect-restore — not from asking GemmaX2 to list names, and not from stuffing a glossary into the official prompt.
+NLLB is no longer the default. `--glossary` YAML is still opt-in extra and is merged longest-first with the file-extracted map. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese cue stay in the sentence (Liu/Zhang). GiNZA **Person** / `N_Person` surfaces (plus speaker brackets) are romanized with pykakasi Hepburn (`野崎` → `Nozaki`) inside the Japanese copy. Place/org surfaces (別班, バンコク) stay Japanese. Not from asking GemmaX2 to list names, and not from stuffing a glossary into the official prompt.
 
 `sublocal transcribe` and `sublocal translate in.srt --to es` stay as debug commands.
 
@@ -99,11 +99,11 @@ sublocal translate input.srt --to es --model q6
 
 Default model is **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF through llama-cpp-python (`n_gpu_layers=-1`, `n_ctx=2048`; CUDA OOM retries once with `n_ctx=1024` before considering `--model q6`). Generation is **completion only** (`create_completion`, never `create_chat_completion`; `chat_format` is cleared so a Gemma2 GGUF cannot wrap the official string). Greedy (`temperature=0`, `top_k=1`). `max_tokens=min(256, n_ctx - prompt_tokens)` — llama-cpp's default of 16 is why a cue can die at “Nozaki es”. If `finish_reason` is `length`, that cue retries once with up to 512. Sequential: one cue at a time. Do not prepend the whole script.
 
-The MT pass logs on stderr: GiNZA entity count, sentinel protect count, `finish_reason` tallies (stop vs length), leftover `→` count in the output SRT, and elapsed seconds.
+The MT pass logs on stderr: GiNZA entity count, in-source Person Hepburn count, `finish_reason` tallies (stop vs length), leftover `→` count, `src_original` retry count, and elapsed seconds.
 
 `--from` is optional. `--glossary` is a UTF-8 YAML map of source names → Latin (see `examples/drama.yml`). It is never loaded unless you pass `--glossary`. There is no default `drama.yml` and no genre-tuned prompt. The official completion prompt is unchanged — no Hepburn instructions, no name list.
 
-Before MT, every source cue is scanned on CPU: GiNZA Person/Place/`N_Person` **ent.text** on Japanese (no clause-length keys; no generic nouns/orgs like 諜報機関 / 撮影開始 / 公安; particles は/が/を/に/で drop the span; max ~12 chars), `《》`/`【】`/`（）` speakers only if the surface is itself a Person/Place name (佐野 yes, 撮影開始 no), Latin already in the file. After protect, if leftover JP is only particles/punct, the official prompt runs on the **original** Japanese and Latin is overlaid (so `当然 別班は裏であり` does not collapse to `Beppan`). Empty or names-only ES retries that cue once unprotected. JP spans are romanized with pykakasi Hepburn and capitalized. That map (plus optional `--glossary`) is applied longest-first as opaque `xx0xx` / `xx1xx` sentinels, then the official GemmaX2 prompt runs on the protected cue, then Latin is restored by exact match. A missing sentinel retries once (space-padded `xxNxx` or `<gN>`); if still missing, that cue overlays leftover JP→Latin and the run continues. The SRT is always written. GiNZA will miss some names (Lemoine/Chaki may stay wrong). Accepted.
+Before MT, every source cue is scanned on CPU: GiNZA Person/Place/`N_Person` **ent.text** on Japanese (no clause-length keys; no generic nouns/orgs like 諜報機関 / 撮影開始 / 公安; particles は/が/を/に/で drop the span; max ~12 chars), `《》`/`【】`/`（）` speakers only if the surface is itself a Person/Place name (佐野 yes, 撮影開始 no), Latin already in the file. The SRT string is immutable. A copy of the cue gets longest-first Person Hepburn, then the official prompt. Speaker-only leftovers (JP after peeling speakers+Person names is under 4 non-space chars) skip GemmaX2 and emit `(Sano)` / `Nozaki`. Empty or names-only ES (every token in the Latin Person set, no verb) retries once on **unmodified** `src_original`. If still empty/names-only, the cue stays Japanese — never a name pile. Closed-set overlay only: Nagasaki → Nozaki iff the source had 野崎. The SRT is always written. GiNZA will miss some names (Lemoine/Chaki may stay wrong). Accepted.
 
 `--device auto` (the default) uses CUDA when `get_cuda_device_count()` is greater than 0 and prints `Using NVIDIA GeForce RTX 4070 Ti (cuda:0)` (or the real `nvidia-smi` name). Official CTranslate2 4.8 Windows wheels dynamically load CUDA 12 (`cublas64_12.dll`, `cudart64_12.dll`); a leftover `CUDA_VISIBLE_DEVICES=-1` or empty value is dropped in this process only. If the count is still 0, stderr prints why (`CUDA_PATH` unset or pointing at v13.x, missing `cublas64_12.dll` on PATH / `CUDA_PATH\bin`) and the run continues so a file still gets written. `--device cuda` exits 1 with the same diagnostic instead of faking CPU.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections import Counter
 from dataclasses import dataclass
@@ -307,6 +308,18 @@ def _build_llama(Llama, model_path: str, n_ctx: int):
     return llama
 
 
+def _completion_accepts_add_special_tokens(complete: object) -> bool:
+    """True when create_completion can take add_special_tokens=False (GemmaX2 card)."""
+    try:
+        sig = inspect.signature(complete)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True
+    return "add_special_tokens" in params
+
+
 def _create_llama(model_path: str, n_ctx: int = DEFAULT_N_CTX):
     """Build llama-cpp Llama. CUDA OOM retries once with n_ctx=1024."""
     from llama_cpp import Llama
@@ -416,13 +429,17 @@ class GemmaXBackend:
         if not callable(complete):
             # llama-cpp Llama.__call__ is create_completion, not chat.
             complete = llama
-        return complete(
-            prompt=prompt,
-            temperature=0,
-            top_k=1,
-            max_tokens=max_tokens,
-            stop=stop,
-        )
+        kwargs: dict = {
+            "prompt": prompt,
+            "temperature": 0,
+            "top_k": 1,
+            "max_tokens": max_tokens,
+            "stop": stop,
+        }
+        if _completion_accepts_add_special_tokens(complete):
+            # GemmaX2 card: do not inject a BOS the template already has.
+            kwargs["add_special_tokens"] = False
+        return complete(**kwargs)
 
     def _record_finish_reason(self, reason: str | None) -> None:
         key = (reason or "other").strip().lower() or "other"

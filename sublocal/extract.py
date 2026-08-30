@@ -16,6 +16,10 @@ from sublocal.lid import LATIN_NAME_RE, is_latin_script, script_heuristic
 # ja_ginza NER labels (spaCy 3.8 + ginza 5.2). Not PERSON/GPE.
 # Government (公安) is real but must not enter the person glossary.
 GINZA_LABELS = frozenset({"Person", "Place", "N_Person"})
+# In-source Hepburn is Person only. Place (別班 / バンコク) stays Japanese.
+GINZA_PERSON_LABELS = frozenset({"Person", "N_Person"})
+# Unit/org surfaces GiNZA may tag Place — never romanize in the MT copy.
+NON_PERSON_KEYS = frozenset({"別班"})
 GINZA_MODEL = "ja_ginza"
 # ja_ginza 5.2.0: bare spacy.load("ja_ginza") raises ConfigValidationError
 # because compound_splitter.split_mode is None.
@@ -216,19 +220,26 @@ def extract_latin(text: str) -> list[str]:
 
 
 def extract_ginza_ents(text: str, nlp: object | None) -> list[str]:
+    return [key for key, _label in extract_ginza_labeled(text, nlp)]
+
+
+def extract_ginza_labeled(
+    text: str, nlp: object | None
+) -> list[tuple[str, str]]:
     if nlp is None:
         return []
     doc = nlp(text)  # type: ignore[operator]
     ents = getattr(doc, "ents", ())
-    out: list[str] = []
+    out: list[tuple[str, str]] = []
     for ent in ents:
-        if getattr(ent, "label_", None) not in GINZA_LABELS:
+        label = getattr(ent, "label_", None)
+        if label not in GINZA_LABELS:
             continue
         raw = clean_glossary_key(str(ent.text))
         stem = honorific_stem(raw)
         key = stem if stem and is_acceptable_name_key(stem) else raw
         if is_acceptable_name_key(key):
-            out.append(key)
+            out.append((key, str(label)))
     return out
 
 
@@ -258,17 +269,27 @@ def _add_span(
     mapping[key] = romanize_hepburn(key)
 
 
+def is_in_source_person_key(key: str) -> bool:
+    """True for Person-like surfaces that may be Hepburn-replaced in a JP copy."""
+    if not key or key in NON_PERSON_KEYS or is_generic_noun(key):
+        return False
+    if is_latin_token(key):
+        return True
+    return bool(_KANJI_NAME.fullmatch(key))
+
+
 def extract_file_glossary(
     texts: Iterable[str],
     langs: Iterable[str] | None = None,
     *,
     nlp: object | None = None,
     load: bool = True,
-) -> tuple[dict[str, str], int]:
+) -> tuple[dict[str, str], int, set[str]]:
     """Build an in-memory source→Latin map from this file only.
 
-    Returns ``(mapping, ginza_entity_count)``. Latin tokens are taken only
-    from non-Latin-script cues (v0.4 copy-through). GiNZA runs on Japanese.
+    Returns ``(mapping, ginza_entity_count, person_keys)``. Latin tokens are
+    taken only from non-Latin-script cues (v0.4 copy-through). GiNZA runs on
+    Japanese. ``person_keys`` are Person/`N_Person` + speaker surfaces only.
     """
     if nlp is None and load:
         nlp = load_ginza()
@@ -276,6 +297,7 @@ def extract_file_glossary(
     mapping: dict[str, str] = {}
     ginza_count = 0
     confirmed: set[str] = set()
+    person_keys: set[str] = set()
     rows: list[tuple[str, str, bool, bool]] = []
     text_list = list(texts)
     for i, text in enumerate(text_list):
@@ -289,23 +311,34 @@ def extract_file_glossary(
         )
         rows.append((text, lang, japanese, non_latin_cue))
         if japanese:
-            ents = extract_ginza_ents(text, nlp)
-            ginza_count += len(ents)
+            labeled = extract_ginza_labeled(text, nlp)
+            ginza_count += len(labeled)
+            ents = [key for key, _label in labeled]
             confirmed.update(ents)
-            for span in ents:
-                _add_span(mapping, span, confirmed=confirmed, source_text=text)
+            for key, label in labeled:
+                _add_span(mapping, key, confirmed=confirmed, source_text=text)
+                if (
+                    label in GINZA_PERSON_LABELS
+                    and key in mapping
+                    and is_in_source_person_key(key)
+                ):
+                    person_keys.add(key)
     for text, _lang, _japanese, non_latin_cue in rows:
         if not non_latin_cue:
             continue
         for span in extract_speakers(text, confirmed=confirmed):
             _add_span(mapping, span, confirmed=confirmed, source_text=text)
+            if span in mapping and is_in_source_person_key(span):
+                person_keys.add(span)
         for span in extract_latin(text):
             mapping.setdefault(span, span)
-    return mapping, ginza_count
+            if is_in_source_person_key(span):
+                person_keys.add(span)
+    return mapping, ginza_count, person_keys
 
 
 def merge_mappings(*maps: dict[str, str] | None) -> dict[str, str]:
-    """Later maps win on key conflict. Glossary applies longest-first at protect."""
+    """Later maps win on key conflict. Longest-first at in-source Hepburn."""
     out: dict[str, str] = {}
     for mapping in maps:
         if mapping:

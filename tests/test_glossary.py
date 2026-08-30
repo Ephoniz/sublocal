@@ -106,16 +106,13 @@ def test_echo_full_cue_strips_particles(tmp_path: Path) -> None:
         glossary=DRAMA,
     )
     assert seen
-    assert any("xx" in t and "に飛んだ" in t for t in seen)
-    assert all("Drum" not in t or "xx" in t for t in seen[:1])
+    assert all("xx0xx" not in t and "<g" not in t for t in seen)
+    assert any("Nozaki" in t and "に飛んだ" in t for t in seen)
     doc = load(out)
     text = doc.cues[0].text
     assert "Nozaki" in text
     assert "Shinjo" in text
-    assert "Bangkok" in text
-    assert "に" not in text
-    assert "が" not in text
-    assert "バンコク" not in text
+    assert "野崎" not in text
 
 
 def test_peel_speaker_allows_leading_bracket() -> None:
@@ -158,20 +155,16 @@ def test_bracketed_speaker_plus_kanji_body(tmp_path: Path) -> None:
         glossary=DRAMA,
     )
     assert seen
+    assert all("xx0xx" not in t for t in seen)
     assert any("フライト" in t or "変更" in t for t in seen)
     doc = load(out)
-    assert doc.cues[0].text.startswith("(Nozaki)")
+    assert "Nozaki" in doc.cues[0].text
     assert "野崎" not in doc.cues[0].text
     assert "フライト" in doc.cues[0].text or "変更" in doc.cues[0].text
-    assert doc.cues[1].text.startswith("(Tojo)") or doc.cues[1].text.startswith(
-        "（Tojo）"
-    )
     assert "Tojo" in doc.cues[1].text
     assert "Nozaki" in doc.cues[1].text
     assert "Shinjo" in doc.cues[1].text
-    assert "Bangkok" in doc.cues[1].text
     assert "東条" not in doc.cues[1].text
-    assert "バンコク" not in doc.cues[1].text
 
 
 def test_yoh_vocative_restores_locally(tmp_path: Path) -> None:
@@ -203,12 +196,11 @@ def test_yoh_vocative_restores_locally(tmp_path: Path) -> None:
         glossary=DRAMA,
     )
     assert seen
-    assert any("xx" in t and "に飛んだ" in t for t in seen)
+    assert all("xx0xx" not in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
     assert "東条" not in doc.cues[0].text
-    assert "よう" not in doc.cues[0].text
-    assert "Bangkok" in doc.cues[1].text
+    assert "バンコク" in "".join(seen) or "Bangkok" in doc.cues[1].text
 
 
 def test_groan_not_sent_output_has_tojo(tmp_path: Path) -> None:
@@ -241,12 +233,10 @@ def test_groan_not_sent_output_has_tojo(tmp_path: Path) -> None:
     )
     assert seen
     assert any("起き" in t for t in seen)
-    # Groan kana is source leftover, not a speaker token / sentinel.
-    assert all("ううっ" not in t or "xx" not in t for t in seen)
+    assert all("xx0xx" not in t for t in seen)
     doc = load(out)
     assert "Tojo" in doc.cues[0].text
     assert "東条" not in doc.cues[0].text
-    assert "Drum" in doc.cues[1].text
     assert "Tojo" in doc.cues[1].text
 
 
@@ -276,38 +266,23 @@ def test_cue37_sends_protected_xxnxx(tmp_path: Path) -> None:
     )
     assert seen
     assert any("起きねえ" in t for t in seen)
-    assert any("xx0xx" in t for t in seen)
-    assert all("Drum" not in t or "xx" in t for t in seen[:1])
+    assert all("xx0xx" not in t for t in seen)
+    assert any("Tojo" in t for t in seen)
     doc = load(out)
-    assert "Drum" in doc.cues[0].text
     assert "Tojo" in doc.cues[0].text
-    assert "ドラム" not in doc.cues[0].text
     assert "東条" not in doc.cues[0].text
-    assert "おい" not in doc.cues[0].text
 
 
-def test_overlay_names_moon_and_tambor() -> None:
-    g = _drama()
-    moon = g.overlay_names("バンコクに飛んだ", "flew to the moon")
-    assert "Bangkok" in moon
-    assert "moon" not in moon.lower()
-    drum = g.overlay_names("ドラム", "tambor")
-    assert "Drum" in drum
-    assert "tambor" not in drum.lower()
-
-
-def test_overlay_nagasaki_and_prepend() -> None:
+def test_overlay_nagasaki_closed_set() -> None:
     g = _drama()
     nozaki = g.overlay_names("野崎", "went to Nagasaki")
     assert "Nozaki" in nozaki
     assert "Nagasaki" not in nozaki
     missing = g.overlay_names("ドラム 東条", "hey still sleeping?")
-    assert missing.startswith("Drum Tojo") or (
-        "Drum" in missing and "Tojo" in missing
-    )
+    assert missing == "hey still sleeping?"
 
 
-def test_pipeline_missing_sentinel_overlays_and_writes(tmp_path: Path) -> None:
+def test_pipeline_writes_without_sentinel_restore(tmp_path: Path) -> None:
     src = tmp_path / "moon.srt"
     src.write_text(
         "1\n00:00:00,000 --> 00:00:02,000\nバンコクに飛んだ\n",
@@ -317,7 +292,8 @@ def test_pipeline_missing_sentinel_overlays_and_writes(tmp_path: Path) -> None:
 
     class MoonBackend(EchoBackend):
         def translate(self, texts, src_flores, tgt_flores):
-            return ["flew to the moon" for _ in texts]
+            assert all("xx" not in t for t in texts)
+            return ["voló a Bangkok" for _ in texts]
 
     translate_file(
         src,
@@ -330,7 +306,6 @@ def test_pipeline_missing_sentinel_overlays_and_writes(tmp_path: Path) -> None:
     assert out.is_file()
     doc = load(out)
     assert "Bangkok" in doc.cues[0].text
-    assert "バンコク" not in doc.cues[0].text
 
 
 def test_restore_to_japanese_keys() -> None:
