@@ -271,3 +271,17 @@ def test_gemmax_does_not_download_when_llama_injected() -> None:
     backend._llama = FakeLlama()
     out = backend.translate(["hello"], "eng_Latn", "spa_Latn")
     assert out == ["Hola"]
+
+
+def test_llama_cpp_python_pinned_0_3_4_cu124() -> None:
+    """0.3.35 cu124 win_amd64 illegal-instruction; pin 0.3.4 so pip cannot float."""
+    root = Path(__file__).resolve().parents[1]
+    pyproject = root.joinpath("pyproject.toml").read_text(encoding="utf-8")
+    readme = root.joinpath("README.md").read_text(encoding="utf-8")
+    assert '"llama-cpp-python==0.3.4"' in pyproject
+    assert ">=0.2.90" not in pyproject
+    assert "0.3.35" not in pyproject.split("llama-cpp-python==0.3.4")[0]
+    assert "abetlen.github.io/llama-cpp-python/whl/cu124" in pyproject
+    assert "llama-cpp-python==0.3.4" in readme
+    assert "0xc000001d" in readme
+    assert "0.3.35" in readme

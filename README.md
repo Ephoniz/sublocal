@@ -23,14 +23,20 @@ Use **official CPython 3.11+** from [python.org](https://www.python.org/download
 ```bash
 git clone https://github.com/Ephoniz/sublocal.git
 cd sublocal
-pip install .
+pip install . --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 ```
 
-GemmaX2 inference needs a **CUDA build** of `llama-cpp-python` (the PyPI wheel is often CPU-only):
+GemmaX2 inference needs the **CUDA 12.4** wheel of **`llama-cpp-python==0.3.4`**. The pin is exact so pip does not pull 0.3.35 from that extra index.
+
+**0.3.35 cu124 win_amd64** raises `OSError 0xc000001d` (illegal instruction) while constructing `llama_context`. That wheel's `ggml-cpu.dll` is built with AVX512/AMX; an i7-13700K reports AVX512=false. **0.3.4 cu124 cp311** loads, offloads 43/43 layers, and completed the 4070 Ti prove.
+
+If `llama-cpp-python` is already installed (including 0.3.35):
 
 ```bash
-CMAKE_ARGS="-DGGML_CUDA=ON" pip install --force-reinstall llama-cpp-python
+pip install --force-reinstall --no-cache-dir "llama-cpp-python==0.3.4" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 ```
+
+Do not `pip install llama-cpp-python` unpinned from the extra index — it resolves 0.3.35.
 
 Short-cue Latin LID when ASR did not stamp lang (optional, local, no API). Package pin is `lingua-language-detector==1.4.2` (2.x needs Python 3.12; this project supports 3.11). Restricted to JA/EN/ES/KO. Main deps pin `regex>=2025.10.22` (transformers 5.16); lingua 1.4.2 asks for `regex<2025`, so a strict resolver will refuse `.[lid]` rather than downgrade regex. Install lingua without its regex pin:
 
@@ -105,7 +111,7 @@ When using `--glossary` for Japanese, pass `--language ja`. Glossary keys are gi
 
 ## Models
 
-**Translate.** Default: **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF through llama-cpp-python CUDA. Not transformers `generate`. Not NLLB-200 3.3B.
+**Translate.** Default: **GemmaX2-28-9B-v0.1 Q5_K_M** GGUF through **llama-cpp-python==0.3.4** (cu124 extra index). Not 0.3.35. Not transformers `generate`. Not NLLB-200 3.3B.
 
 Default weights: [`mradermacher/GemmaX2-28-9B-v0.1-GGUF`](https://huggingface.co/mradermacher/GemmaX2-28-9B-v0.1-GGUF) file `GemmaX2-28-9B-v0.1.Q5_K_M.gguf` (6.65 GB). Card: [`ModelSpace/GemmaX2-28-9B-v0.1`](https://huggingface.co/ModelSpace/GemmaX2-28-9B-v0.1). Paper: [arxiv 2502.02481](https://arxiv.org/abs/2502.02481). Fallback quant: `--model q6` (`GemmaX2-28-9B-v0.1.Q6_K.gguf`, 7.59 GB). Do not default Q4.
 

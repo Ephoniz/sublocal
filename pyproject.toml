@@ -26,7 +26,7 @@ dependencies = [
   "faster-whisper>=1.0.0",
   "huggingface-hub>=0.23.0",
   "langdetect>=1.0.9",
-  "llama-cpp-python>=0.2.90",
+  "llama-cpp-python==0.3.4",
   "regex>=2025.10.22",
   "sentencepiece>=0.2.0",
   "stable-ts-whisperless>=2.18.0",
@@ -45,6 +45,18 @@ Homepage = "https://github.com/Ephoniz/sublocal"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sublocal"]
+
+# 0.3.35 cu124 win_amd64 raises OSError 0xc000001d (illegal instruction) in
+# llama_context: ggml-cpu.dll is built with AVX512/AMX; i7-13700K AVX512=false.
+# 0.3.4 cu124 cp311 loads and offloads 43/43 layers. pip must not resolve 0.3.35.
+#   pip install . --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+[[tool.uv.index]]
+name = "llama-cpp-cu124"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+llama-cpp-python = { index = "llama-cpp-cu124" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
