@@ -121,6 +121,45 @@ def test_echo_full_cue_strips_particles(tmp_path: Path) -> None:
     assert "バンコク" not in text
 
 
+def test_yoh_vocative_restores_locally(tmp_path: Path) -> None:
+    src = tmp_path / "yoh.srt"
+    src.write_text(
+        "10\n"
+        "00:00:15,000 --> 00:00:16,000\n"
+        "＜よう 東条＞\n"
+        "\n"
+        "11\n"
+        "00:00:16,000 --> 00:00:18,000\n"
+        "バンコクに飛んだ\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "yoh.es.srt"
+    seen: list[str] = []
+
+    class Recorder(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            seen.extend(texts)
+            return super().translate(texts, src_flores, tgt_flores)
+
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=Recorder(),
+        glossary=DRAMA,
+    )
+    assert seen
+    assert all("よう" not in t for t in seen)
+    assert all("東条" not in t for t in seen)
+    assert any("に飛んだ" in t for t in seen)
+    doc = load(out)
+    assert "Tojo" in doc.cues[0].text
+    assert "東条" not in doc.cues[0].text
+    assert "よう" not in doc.cues[0].text
+    assert "Bangkok" in doc.cues[1].text
+
+
 def test_groan_not_sent_output_has_tojo(tmp_path: Path) -> None:
     src = tmp_path / "groan.srt"
     src.write_text(

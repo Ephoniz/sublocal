@@ -22,7 +22,7 @@ _GLS_RE = re.compile(r"GLS\s*(\d+)", re.IGNORECASE)
 _XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 _SPEAKER_RE = re.compile(r"^[（(]([^）)]+)[）)]\s*")
-_PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい")
+_PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい", "よう")
 _BRACKETS = "《》＜＞「」"
 
 

@@ -8,7 +8,13 @@ from sublocal.backend import EchoBackend, NllbBackend, TranslatorBackend
 from sublocal.detect import detect_iso639
 from sublocal.formats import dumps, load, save
 from sublocal.formats.base import Document
-from sublocal.glossary import Glossary, GlossaryError, as_glossary, has_cjk
+from sublocal.glossary import (
+    Glossary,
+    GlossaryError,
+    as_glossary,
+    has_cjk,
+    needs_nllb,
+)
 from sublocal.languages import display_code, to_flores
 from sublocal.progress import status
 
@@ -75,6 +81,12 @@ def translate_document(
         guarded, pairs = gloss.protect(text)
         guarded_by_i[i] = guarded
         pairs_by_i[i] = pairs
+        if pairs and not needs_nllb(guarded):
+            restored = gloss.restore(guarded, pairs, target="value")
+            translated[i] = gloss.cleanup_adjacent(
+                restored, [v for _, v in pairs]
+            )
+            continue
         send_idx.append(i)
         to_send.append(guarded)
 
