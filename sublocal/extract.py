@@ -33,6 +33,20 @@ _NAME_PARTICLES = ("は", "が", "を", "に", "で")
 _HONORIFICS = ("さん", "くん", "ちゃん", "様")
 _TRAILING_JUNK = "）)」。.、， "
 MAX_NAME_KEY_CHARS = 12
+# Generic nouns / orgs / stage directions — never glossary keys.
+GENERIC_NAME_KEYS = frozenset(
+    {
+        "諜報機関",
+        "撮影開始",
+        "公安",
+        "政府",
+        "機関",
+        "開始",
+    }
+)
+_GENERIC_SUFFIXES = ("機関", "開始", "公安部")
+_KANJI_NAME = re.compile(r"^[\u3400-\u9fff]{2,4}$")
+_KATAKANA_NAME = re.compile(r"^[\u30a0-\u30ffー]{2,8}$")
 
 
 def is_latin_token(text: str) -> bool:
@@ -92,23 +106,68 @@ def clean_glossary_key(span: str) -> str:
     return span.strip().strip(_TRAILING_JUNK)
 
 
+def is_generic_noun(key: str) -> bool:
+    """諜報機関 / 撮影開始 / 公安 and similar orgs — not person names."""
+    if key in GENERIC_NAME_KEYS or "公安" in key:
+        return True
+    return any(key.endswith(suffix) for suffix in _GENERIC_SUFFIXES)
+
+
+def is_person_place_surface(key: str, confirmed: Iterable[str] | None = None) -> bool:
+    """佐野 yes, 撮影開始 no. Confirmed GiNZA Person/Place always wins."""
+    if not key:
+        return False
+    if confirmed is not None and key in set(confirmed):
+        return True
+    if is_generic_noun(key):
+        return False
+    return bool(_KANJI_NAME.fullmatch(key) or _KATAKANA_NAME.fullmatch(key))
+
+
 def is_acceptable_name_key(key: str) -> bool:
-    """Keep Person/Place surfaces. Drop clause-length and particle-glued junk."""
+    """Keep Person/Place surfaces. Drop clause-length, generics, particle junk."""
     if not key:
         return False
     if is_latin_token(key):
         return True
-    if "公安" in key:
+    if is_generic_noun(key):
         return False
-    if any(particle in key for particle in _NAME_PARTICLES):
+    if key in _HONORIFICS:
         return False
     if any(key.endswith(suffix) for suffix in _HONORIFICS):
+        return False
+    if any(particle in key for particle in _NAME_PARTICLES):
         return False
     if len(key) > MAX_NAME_KEY_CHARS:
         return False
     if any(mark in key for mark in ("。", "？", "?", "！", "!", "→")):
         return False
     return True
+
+
+def honorific_stem(key: str) -> str | None:
+    """``野崎さん`` → ``野崎`` when the honorific is attached to a name."""
+    for suffix in _HONORIFICS:
+        if key.endswith(suffix) and len(key) > len(suffix):
+            return key[: -len(suffix)]
+    return None
+
+
+def rest_after_speakers(text: str) -> str:
+    """Cue body after stripping 《》/【】/leading （Name）."""
+    out = _SPEAKER_GUILLEMET_RE.sub("", text)
+    out = _SPEAKER_LENTICULAR_RE.sub("", out)
+    out = _SPEAKER_START_PAREN_RE.sub("", out)
+    return out.strip().strip("《》【】→ ").strip()
+
+
+def is_whole_short_cue_key(key: str, text: str) -> bool:
+    """Reject a key that is the entire leftover of a short cue (《撮影開始》)."""
+    rest = rest_after_speakers(text)
+    if rest:
+        return key == rest and len(key) <= MAX_NAME_KEY_CHARS
+    stripped = text.strip().strip("《》【】（）()→ ").strip()
+    return key == stripped and len(key) <= MAX_NAME_KEY_CHARS
 
 
 def _name_sized(span: str) -> bool:
@@ -127,8 +186,10 @@ def _speaker_candidates(span: str) -> list[str]:
     return []
 
 
-def extract_speakers(text: str) -> list[str]:
-    """《name》, 【name】, and leading （name） / (name)."""
+def extract_speakers(
+    text: str, confirmed: Iterable[str] | None = None
+) -> list[str]:
+    """（Name）/《Name》 only if Name is a Person/Place surface (佐野 yes)."""
     found: list[str] = []
     for span in _SPEAKER_GUILLEMET_RE.findall(text):
         found.extend(_speaker_candidates(span))
@@ -137,8 +198,17 @@ def extract_speakers(text: str) -> list[str]:
     match = _SPEAKER_START_PAREN_RE.match(text)
     if match:
         found.append(match.group(1).strip())
-    cleaned = [clean_glossary_key(span) for span in found]
-    return [span for span in cleaned if is_acceptable_name_key(span)]
+    confirmed_set = set(confirmed) if confirmed is not None else None
+    out: list[str] = []
+    for span in found:
+        key = clean_glossary_key(span)
+        if is_generic_noun(key):
+            continue
+        if not is_person_place_surface(key, confirmed_set):
+            continue
+        if is_acceptable_name_key(key) or (confirmed_set is not None and key in confirmed_set):
+            out.append(key)
+    return out
 
 
 def extract_latin(text: str) -> list[str]:
@@ -154,15 +224,33 @@ def extract_ginza_ents(text: str, nlp: object | None) -> list[str]:
     for ent in ents:
         if getattr(ent, "label_", None) not in GINZA_LABELS:
             continue
-        key = clean_glossary_key(str(ent.text))
+        raw = clean_glossary_key(str(ent.text))
+        stem = honorific_stem(raw)
+        key = stem if stem and is_acceptable_name_key(stem) else raw
         if is_acceptable_name_key(key):
             out.append(key)
     return out
 
 
-def _add_span(mapping: dict[str, str], span: str) -> None:
+def _add_span(
+    mapping: dict[str, str],
+    span: str,
+    *,
+    confirmed: set[str] | None = None,
+    source_text: str = "",
+) -> None:
     key = clean_glossary_key(span)
-    if not is_acceptable_name_key(key) or key in mapping:
+    if is_generic_noun(key):
+        return
+    if not is_acceptable_name_key(key) and not (
+        confirmed is not None and key in confirmed
+    ):
+        return
+    if source_text and is_whole_short_cue_key(key, source_text) and (
+        confirmed is None or key not in confirmed
+    ):
+        return
+    if key in mapping:
         return
     if is_latin_token(key):
         mapping[key] = key
@@ -187,7 +275,10 @@ def extract_file_glossary(
     lang_list = list(langs) if langs is not None else []
     mapping: dict[str, str] = {}
     ginza_count = 0
-    for i, text in enumerate(texts):
+    confirmed: set[str] = set()
+    rows: list[tuple[str, str, bool, bool]] = []
+    text_list = list(texts)
+    for i, text in enumerate(text_list):
         lang = lang_list[i] if i < len(lang_list) else ""
         script = script_heuristic(text)
         japanese = script == "ja" or (
@@ -196,17 +287,20 @@ def extract_file_glossary(
         non_latin_cue = (script in {"ja", "ko"}) or (
             bool(lang) and not is_latin_script(lang)
         )
+        rows.append((text, lang, japanese, non_latin_cue))
         if japanese:
             ents = extract_ginza_ents(text, nlp)
             ginza_count += len(ents)
+            confirmed.update(ents)
             for span in ents:
-                _add_span(mapping, span)
-        # Speakers and Latin copy-through are for JA/KO cues, not (suspiro) in ES.
-        if non_latin_cue:
-            for span in extract_speakers(text):
-                _add_span(mapping, span)
-            for span in extract_latin(text):
-                mapping.setdefault(span, span)
+                _add_span(mapping, span, confirmed=confirmed, source_text=text)
+    for text, _lang, _japanese, non_latin_cue in rows:
+        if not non_latin_cue:
+            continue
+        for span in extract_speakers(text, confirmed=confirmed):
+            _add_span(mapping, span, confirmed=confirmed, source_text=text)
+        for span in extract_latin(text):
+            mapping.setdefault(span, span)
     return mapping, ginza_count
 
 

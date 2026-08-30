@@ -393,11 +393,15 @@ def test_junk_clause_keys_not_in_extracted_map() -> None:
                 {
                     "ents": [
                         Ent("野崎", "Person"),
+                        Ent("佐野", "Person"),
+                        Ent("別班", "Place"),
                         Ent("野崎が大きく息を吐く", "Person"),
                         Ent("野崎さん", "Person"),
                         Ent("野崎をマネて", "Person"),
                         Ent("佐野）", "Person"),
                         Ent("佐野公安部", "Person"),
+                        Ent("撮影開始", "Person"),
+                        Ent("諜報機関", "Person"),
                         Ent("公安", "Government"),
                     ]
                 },
@@ -405,12 +409,20 @@ def test_junk_clause_keys_not_in_extracted_map() -> None:
 
     texts = [
         "（佐野）5年前 野崎は北京で→",
+        "当然 別班は裏であり→",
+        "《撮影開始》",
         "野崎が大きく息を吐く",
         "野崎さん",
+        "諜報機関だ",
     ]
-    mapping, _count = extract_file_glossary(texts, ["ja", "ja", "ja"], nlp=Nlp(), load=False)
+    mapping, _count = extract_file_glossary(
+        texts, ["ja"] * len(texts), nlp=Nlp(), load=False
+    )
     assert "野崎" in mapping
     assert "佐野" in mapping
+    assert "別班" in mapping
+    assert "撮影開始" not in mapping
+    assert "諜報機関" not in mapping
     assert "野崎が大きく息を吐く" not in mapping
     assert "野崎さん" not in mapping
     assert "野崎をマネて" not in mapping
@@ -451,6 +463,76 @@ def test_missing_sentinel_fails_cue_not_document(tmp_path: Path, capsys) -> None
     assert "overlay leftover names" in err
     assert "finish_reason stop=" in err
     assert "leftover arrows" in err
+
+
+def test_sentinel_only_cue_sends_original_jp(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "beppan.srt",
+        [("00:00:00,000 --> 00:00:02,000", "別班は→")],
+    )
+    llama = RecordingLlama()
+    llama.tokenize = None  # type: ignore[method-assign]
+    seen: list[str] = []
+
+    def complete(prompt=None, **kwargs):
+        llama.prompts.append(prompt)
+        llama.kwargs.append(kwargs)
+        seen.append(prompt or "")
+        return {
+            "choices": [
+                {"text": "La seccion secreta opera en la sombra", "finish_reason": "stop"}
+            ]
+        }
+
+    llama.create_completion = complete  # type: ignore[method-assign]
+    backend = GemmaXBackend(device="cpu")
+    backend._llama = llama
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=backend,
+        glossary=Glossary({"別班": "Beppan"}),
+    )
+    assert llama.prompts
+    sent = llama.prompts[0]
+    assert "別班" in sent
+    assert "xx0xx" not in sent
+    assert "Hepburn" not in sent
+    assert "Keep person names" not in sent
+    assert "Beppan" in doc.cues[0].text
+    assert doc.cues[0].text != "Beppan"
+
+
+def test_empty_completion_retries_unprotected(tmp_path: Path) -> None:
+    src = _srt(
+        tmp_path,
+        "empty.srt",
+        [("00:00:00,000 --> 00:00:02,000", "野崎が飛んだ")],
+    )
+    calls: list[list[str]] = []
+
+    class EmptyThenSentence(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            calls.append(list(texts))
+            if len(calls) == 1:
+                return ["" for _ in texts]
+            return ["Hablo de un vuelo urgente" for _ in texts]
+
+    doc = load(src)
+    translate_document(
+        doc,
+        to_code="es",
+        from_code="ja",
+        backend=EmptyThenSentence(),
+        glossary=Glossary({"野崎": "Nozaki"}),
+    )
+    assert len(calls) >= 2
+    assert all(cues[0].text for cues in [doc.cues])
+    assert doc.cues[0].text.strip()
+    assert "Nozaki" in doc.cues[0].text or "Hablo" in doc.cues[0].text
 
 
 def test_create_completion_max_tokens_still_256() -> None:

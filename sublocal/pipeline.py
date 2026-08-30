@@ -22,7 +22,8 @@ from sublocal.glossary import (
     GlossaryError,
     as_glossary,
     has_cjk,
-    needs_nllb,
+    is_names_only_output,
+    leftover_has_jp_content,
 )
 from sublocal.languages import display_code, to_flores
 from sublocal.lid import (
@@ -134,6 +135,8 @@ def translate_document(
     groups: dict[str, list[int]] = {}
     pairs_by_i: list[list[tuple[str, str]]] = [[] for _ in texts]
     source_by_i: list[str] = [""] * len(texts)
+    orig_cue_by_i: list[str] = list(texts)
+    overlay_only: list[bool] = [False] * len(texts)
     latin_by_i: list[list[str]] = [[] for _ in texts]
     speaker_prefix: list[str | None] = [None] * len(texts)
     protect_count = 0
@@ -155,14 +158,15 @@ def translate_document(
                 work = rest
             guarded, pairs = gloss.protect(work)
             protect_count += len(pairs)
-            if pairs and not needs_nllb(guarded):
-                restored = gloss.restore(guarded, pairs, target="value")
-                body = gloss.cleanup_adjacent(restored, [v for _, v in pairs])
-                translated[i] = _with_speaker(speaker_prefix[i], body)
-                continue
-            pairs_by_i[i] = pairs
             source_by_i[i] = work
-            send = guarded
+            if pairs and not leftover_has_jp_content(guarded):
+                # Sentinel-only leftover: official prompt on ORIGINAL JP, then overlay.
+                send = work
+                pairs_by_i[i] = []
+                overlay_only[i] = True
+            else:
+                pairs_by_i[i] = pairs
+                send = guarded
         else:
             send = work
             if not is_latin_script(src):
@@ -204,7 +208,11 @@ def translate_document(
             if latin_by_i[i]:
                 mt = restore_latin_names(mt, latin_by_i[i])
             body = mt
-            if gloss is not None and pairs_by_i[i]:
+            latins = [v for _, v in pairs_by_i[i]] if pairs_by_i[i] else []
+            if gloss is not None and overlay_only[i]:
+                body = gloss.overlay_names(source_by_i[i] or orig_cue_by_i[i], mt)
+                latins = [v for k, v in gloss.entries if k in (source_by_i[i] or orig_cue_by_i[i])]
+            elif gloss is not None and pairs_by_i[i]:
                 body = _restore_or_retry(
                     gloss,
                     mt,
@@ -217,9 +225,24 @@ def translate_document(
                     cue_index=i,
                 )
                 latins = [v for _, v in pairs_by_i[i]]
-                if latins:
-                    body = gloss.cleanup_adjacent(body, latins)
-            translated[i] = _with_speaker(speaker_prefix[i], body)
+            if gloss is not None and latins:
+                body = gloss.cleanup_adjacent(body, latins)
+            if speaker_prefix[i]:
+                latins = list(latins) + [speaker_prefix[i].strip("()")]
+            body = _with_speaker(speaker_prefix[i], body)
+            if gloss is not None and (
+                is_names_only_output(body, latins) or has_cjk(body)
+            ):
+                status(f"Cue {i + 1}: empty/names-only ES; retry unprotected original")
+                original = source_by_i[i] or orig_cue_by_i[i]
+                retry = backend.translate([original], src, tgt)
+                retry_text = retry[0] if retry else ""
+                body = gloss.overlay_names(original, retry_text)
+                all_latins = [v for k, v in gloss.entries if k in original]
+                if all_latins:
+                    body = gloss.cleanup_adjacent(body, all_latins)
+                body = _with_speaker(speaker_prefix[i], body)
+            translated[i] = body
     elapsed = time.monotonic() - started
     finals = [t if t is not None else "" for t in translated]
     apply_translations(doc, finals)

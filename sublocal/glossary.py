@@ -21,6 +21,15 @@ _SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
 _EXACT_SENTINEL_RE = re.compile(r"xx(\d+)xx", re.IGNORECASE)
 _XML_RE = re.compile(r"<\s*g\s*(\d+)\s*>", re.IGNORECASE)
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
+_JP_ANY_RE = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u9fff\uf900-\ufaff]")
+_JP_RUN_RE = r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u9fff\uf900-\ufaff]+"
+_LEFTOVER_FILLER_RE = re.compile(
+    r"[0-9０-９\s→\-–—\.。、，！？!?…《》【】（）()＜＞「」『』・/／]"
+)
+_LEFTOVER_PARTICLE_RE = re.compile(r"[はがをにでのとへもようおい]")
+_NAMES_ONLY_PUNCT_RE = re.compile(
+    r"[→\-–—\(\)\[\]《》【】<>\"'\s\.,;:!?。、，＋+…/／]"
+)
 _SPEAKER_RE = re.compile(r"^[《＜「『]*[（(]([^）)]+)[）)]\s*")
 _WRAPPERS = "《》＜＞「」『』"
 _PARTICLES = ("に", "が", "を", "は", "の", "と", "へ", "おい", "よう")
@@ -64,6 +73,30 @@ def needs_nllb(protected: str) -> bool:
 
 def has_cjk(text: str) -> bool:
     return _CJK_RE.search(text) is not None
+
+
+def leftover_has_jp_content(protected: str) -> bool:
+    """False when leftover is only sentinels, particles, digits, arrows, punct.
+
+    Those cues must not go to GemmaX2 as locked ``xxNxx`` tokens.
+    """
+    stripped = _strip_sentinels(protected)
+    stripped = _LEFTOVER_FILLER_RE.sub("", stripped)
+    stripped = _LEFTOVER_PARTICLE_RE.sub("", stripped)
+    return _JP_ANY_RE.search(stripped) is not None
+
+
+def is_names_only_output(text: str, latin_values: list[str]) -> bool:
+    """Empty, or only restored names / sentinels / arrows / punctuation."""
+    out = text.strip()
+    if not out:
+        return True
+    for latin in sorted({v for v in latin_values if v}, key=len, reverse=True):
+        out = re.sub(re.escape(latin), " ", out, flags=re.IGNORECASE)
+    out = _SENTINEL_MUTATION_RE.sub(" ", out)
+    out = _XML_RE.sub(" ", out)
+    out = _NAMES_ONLY_PUNCT_RE.sub("", out)
+    return not out.strip()
 
 
 def load_mapping(path: str | Path) -> dict[str, str]:
@@ -247,6 +280,9 @@ class Glossary:
             out = re.sub(rf"(?:{particle})\s*({name})", r"\1", out)
             out = re.sub(rf"[{brackets}]\s*({name})", r"\1", out)
             out = re.sub(rf"({name})\s*[{brackets}]", r"\1", out)
+            # Cue 32: Nozakiマークしていた → strip JP glued to the Latin name.
+            out = re.sub(rf"({name}){_JP_RUN_RE}", r"\1", out)
+            out = re.sub(rf"{_JP_RUN_RE}({name})", r"\1", out)
         out = re.sub(r"[^\S\n]+", " ", out)
         return out.strip()
 
