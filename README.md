@@ -8,7 +8,7 @@ v0.5 is one command: transcribe mixed-language audio/video, stamp a language on 
 sublocal clip.mp4 --to es
 ```
 
-Writes `clip.es.srt` and a sidecar `clip.cues.jsonl` (`start`, `end`, `text`, `lang`). No `--language` required. Whisper `task=translate` is never the Spanish path.
+The end result is `clip.es.srt` (the overlay file); `clip.cues.jsonl` is an optional lang sidecar for debug (`start`, `end`, `text`, `lang`), not the overlay. No `--language` required. Whisper `task=translate` is never the Spanish path.
 
 NLLB is no longer the default. `--glossary` is still opt-in. There is no default `drama.yml`. Latin/ASCII tokens already in a Japanese (or other non-Latin) cue are copied through and not sent to the model (Liu/Zhang stay Latin). Kanji names: first-pass official GemmaX prompt only; no NER.
 
