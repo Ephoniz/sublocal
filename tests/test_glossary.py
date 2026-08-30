@@ -79,6 +79,16 @@ def test_needs_nllb_true_for_real_dialogue() -> None:
     assert needs_nllb(protected) is True
 
 
+def test_pad_sentinels_spaces_glued_name() -> None:
+    g = _drama()
+    protected, pairs = g.protect("＜いいか東条\nこれから聞くことに素直に答えれば＞")
+    assert "いいかxx0xx" in protected
+    padded = g.pad_sentinels(protected)
+    assert "いいか xx0xx" in padded
+    assert "いいかxx0xx" not in padded
+    assert g.restore(padded, pairs) == "＜いいか Tojo\nこれから聞くことに素直に答えれば＞"
+
+
 def test_restore_accepts_spaced_and_cased_sentinels() -> None:
     g = _drama()
     _protected, pairs = g.protect("ドラム")
@@ -125,6 +135,69 @@ def test_echo_backend_glossary_restores_latin(tmp_path: Path) -> None:
     assert "Drum" in doc.cues[1].text
     assert "Tojo" in doc.cues[1].text
     assert "起き" in doc.cues[1].text
+
+
+def test_glued_kanji_cue_is_padded_before_nllb(tmp_path: Path) -> None:
+    src = tmp_path / "glued.srt"
+    src.write_text(
+        "13\n"
+        "00:00:20,000 --> 00:00:23,000\n"
+        "＜いいか東条\nこれから聞くことに素直に答えれば＞\n"
+        "\n"
+        "5\n"
+        "00:00:07,000 --> 00:00:08,500\n"
+        "（東条）ううっ あっ あっ…\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "glued.es.srt"
+    seen: list[str] = []
+
+    class Recorder(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            seen.extend(texts)
+            return super().translate(texts, src_flores, tgt_flores)
+
+    translate_file(
+        src,
+        to_code="es",
+        from_code="ja",
+        output_path=out,
+        backend=Recorder(),
+        glossary=DRAMA,
+    )
+    assert seen
+    assert any("いいか xx0xx" in t for t in seen)
+    assert all("いいかxx0xx" not in t for t in seen)
+    assert all("ううっ" not in t for t in seen)
+    doc = load(out)
+    assert "Tojo" in doc.cues[0].text
+    assert "いいか" in doc.cues[0].text
+    assert "聞く" in doc.cues[0].text
+    assert "Tojo" in doc.cues[1].text
+    assert "ううっ" in doc.cues[1].text
+
+
+def test_kanji_cue_missing_sentinel_after_padding_fails(tmp_path: Path) -> None:
+    src = tmp_path / "drop.srt"
+    src.write_text(
+        "1\n00:00:00,000 --> 00:00:02,000\nいいか東条 まだ起きねえのか？\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "drop.es.srt"
+
+    class Drop(EchoBackend):
+        def translate(self, texts, src_flores, tgt_flores):
+            return ["tambor" for _ in texts]
+
+    with pytest.raises(GlossaryError, match="xx0xx"):
+        translate_file(
+            src,
+            to_code="es",
+            from_code="ja",
+            output_path=out,
+            backend=Drop(),
+            glossary=DRAMA,
+        )
 
 
 def test_restore_to_japanese_keys() -> None:

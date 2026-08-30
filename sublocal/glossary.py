@@ -17,6 +17,7 @@ from typing import Literal
 
 # Mutations NLLB sometimes emits around the opaque sentinel.
 _SENTINEL_MUTATION_RE = re.compile(r"xx\s*(\d+)\s*xx", re.IGNORECASE)
+_EXACT_SENTINEL_RE = re.compile(r"xx(\d+)xx", re.IGNORECASE)
 
 # CJK Unified Ideographs (incl. compatibility). Hiragana/katakana do not match.
 _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
@@ -115,6 +116,22 @@ class Glossary:
                 pairs.append((key, value))
                 start = idx + len(token)
         return out, pairs
+
+    def pad_sentinels(self, protected: str) -> str:
+        """Insert spaces around ``xxNxx`` so NLLB does not swallow a glued name.
+
+        ``いいかxx0xx`` → ``いいか xx0xx``. Already-spaced sentinels are left
+        as-is. Skip-NLLB cues must not be padded; they restore locally.
+        """
+
+        def _pad(match: re.Match[str]) -> str:
+            start, end = match.span()
+            token = f"xx{int(match.group(1))}xx"
+            left = "" if start == 0 or protected[start - 1].isspace() else " "
+            right = "" if end == len(protected) or protected[end].isspace() else " "
+            return f"{left}{token}{right}"
+
+        return _EXACT_SENTINEL_RE.sub(_pad, protected)
 
     def restore(
         self,

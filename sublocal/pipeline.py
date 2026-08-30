@@ -64,6 +64,8 @@ def translate_document(
         texts = protected
     send_idx = [i for i, skip in enumerate(local_only) if not skip]
     to_send = [texts[i] for i in send_idx]
+    if gloss is not None:
+        to_send = [gloss.pad_sentinels(t) for t in to_send]
     prepare = getattr(backend, "prepare", None)
     if callable(prepare) and to_send:
         prepare()
